@@ -544,14 +544,41 @@ pub fn init_state(
     window.set_blur(true);
 
     pollster::block_on(async move {
+        // WSL2's Mesa `dzn` driver (Vulkan-on-D3D12) is the only way to reach a
+        // real GPU from inside a Linux WSL guest, but it advertises
+        // `conformanceVersion = 0.0.0.0` because it's a translation layer and
+        // can't pass the Vulkan CTS. wgpu-hal hides such adapters unless
+        // `ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER` is set, which on native
+        // Linux/macOS/Windows with conformant drivers is a no-op.
+        let instance_flags = (wgpu::InstanceFlags::from_build_config()
+            | wgpu::InstanceFlags::ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER)
+            .with_env();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
+            flags: instance_flags,
             ..Default::default()
         });
 
         let surface = instance
             .create_surface(window.clone())
             .context("failed to create surface")?;
+
+        for (index, probe) in instance.enumerate_adapters(wgpu::Backends::all()).into_iter().enumerate() {
+            let info = probe.get_info();
+            let surface_supported = probe.is_surface_supported(&surface);
+            tracing::info!(
+                index,
+                name = info.name,
+                vendor = info.vendor,
+                device = info.device,
+                device_type = ?info.device_type,
+                driver = info.driver,
+                driver_info = info.driver_info,
+                backend = ?info.backend,
+                surface_supported,
+                "enumerated wgpu adapter",
+            );
+        }
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -562,8 +589,28 @@ pub fn init_state(
             .await
             .context("failed to find compatible adapter")?;
 
+        let adapter_info = adapter.get_info();
+        tracing::info!(
+            name = adapter_info.name,
+            vendor = adapter_info.vendor,
+            device = adapter_info.device,
+            device_type = ?adapter_info.device_type,
+            driver = adapter_info.driver,
+            driver_info = adapter_info.driver_info,
+            backend = ?adapter_info.backend,
+            "selected wgpu adapter",
+        );
+
         let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: Some("autopilot-desktop-device"),
+                    required_features: wgpu::Features::empty(),
+                    required_limits: adapter.limits(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                },
+                None,
+            )
             .await
             .context("failed to create device")?;
 
@@ -1426,6 +1473,7 @@ pub fn render_frame(state: &mut RenderState) -> Result<crate::app_state::FrameRe
     }
 
     let provider_blockers = state.provider_blockers();
+    let sidebar_go_online_enabled = state.mission_control_go_online_enabled();
     let provider_inventory = crate::provider_inventory::inventory_status_for_state(state);
     let training_status = crate::desktop_control::current_training_status(state);
     let remote_training_status = crate::desktop_control::current_remote_training_status(state);
@@ -1490,16 +1538,21 @@ pub fn render_frame(state: &mut RenderState) -> Result<crate::app_state::FrameRe
 
             let go_online_bounds = Bounds::new(left, 72.0, (panel_width - 24.0).max(120.0), 34.0);
             let is_online = state.provider_runtime.mode != ProviderMode::Offline;
+            let go_online_enabled = sidebar_go_online_enabled;
             let action_label = if is_online { "GO OFFLINE" } else { "GO ONLINE" };
             paint.scene.draw_quad(
                 Quad::new(go_online_bounds)
-                    .with_background(if is_online {
+                    .with_background(if !go_online_enabled {
+                        theme::bg::APP.with_alpha(0.40)
+                    } else if is_online {
                         theme::status::ERROR.with_alpha(0.25)
                     } else {
                         theme::status::SUCCESS.with_alpha(0.28)
                     })
                     .with_border(
-                        if is_online {
+                        if !go_online_enabled {
+                            theme::border::DEFAULT.with_alpha(0.50)
+                        } else if is_online {
                             theme::status::ERROR.with_alpha(0.75)
                         } else {
                             theme::status::SUCCESS.with_alpha(0.75)

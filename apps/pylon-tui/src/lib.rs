@@ -2358,7 +2358,9 @@ impl AppShell {
                             }
                         };
                         let (wallet_status, last_wallet_error) =
-                            match pylon::load_wallet_status_report(config_path.as_path()).await {
+                            match pylon::load_wallet_balance_status_report(config_path.as_path())
+                                .await
+                            {
                                 Ok(report) => (Some(report), None),
                                 Err(error) => (None, Some(error.to_string())),
                             };
@@ -3021,6 +3023,21 @@ impl AppShell {
 
     fn model_lines(&self) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        if self.startup_status_is_loading() {
+            lines.push(Line::from("runtime: loading current status"));
+            lines.push(Line::from(""));
+        } else {
+            let runtime_ready = gemma_runtime_ready_models(self.loaded.as_ref());
+            lines.push(Line::from(format!(
+                "runtime ready: {}",
+                if runtime_ready.is_empty() {
+                    "none".to_string()
+                } else {
+                    runtime_ready.join(", ")
+                }
+            )));
+            lines.push(Line::from(""));
+        }
         for (index, spec) in pylon::gemma_download_specs().iter().enumerate() {
             if index > 0 {
                 lines.push(Line::from(""));
@@ -3529,6 +3546,10 @@ impl AppShell {
         }
     }
 
+    fn startup_status_is_loading(&self) -> bool {
+        self.last_refresh_at.is_none() && (self.refresh_in_flight || self.loaded.is_none())
+    }
+
     fn startup_detail(&self) -> Option<String> {
         if self.last_refresh_at.is_none() && self.operator_stats.runtime_status.is_none() {
             return Some("Starting local checks for Gemma, wallet, and node status.".to_string());
@@ -3608,6 +3629,7 @@ impl AppShell {
     }
 
     fn sync_transcript_scroll_after_update(&mut self) {
+        self.refresh_transcript_scroll_metrics();
         if self.transcript_follow_latest {
             self.transcript_scroll_y = self.transcript_max_scroll_y;
         } else {
@@ -3631,15 +3653,23 @@ impl AppShell {
     fn update_transcript_layout(&mut self, area: Rect) {
         self.transcript_wrap_width = transcript_wrap_width(area);
         self.transcript_viewport_height = transcript_viewport_height(area);
-        self.transcript_max_scroll_y = max_transcript_scroll_y(
-            self.rendered_transcript_row_count(self.transcript_wrap_width),
-            self.transcript_viewport_height,
-        );
+        self.refresh_transcript_scroll_metrics();
         if self.transcript_follow_latest {
             self.transcript_scroll_y = self.transcript_max_scroll_y;
         } else {
             self.transcript_scroll_y = self.transcript_scroll_y.min(self.transcript_max_scroll_y);
         }
+    }
+
+    fn refresh_transcript_scroll_metrics(&mut self) {
+        if self.transcript_wrap_width == 0 || self.transcript_viewport_height == 0 {
+            self.transcript_max_scroll_y = 0;
+            return;
+        }
+        self.transcript_max_scroll_y = max_transcript_scroll_y(
+            self.rendered_transcript_row_count(self.transcript_wrap_width),
+            self.transcript_viewport_height,
+        );
     }
 
     fn rendered_transcript_row_count(&self, wrap_width: u16) -> usize {
@@ -4389,11 +4419,12 @@ fn compute_operator_panel_stats_at(
     now_ms: u64,
 ) -> OperatorPanelStats {
     let since_ms = now_ms.saturating_sub(LOOKBACK_WINDOW_24H_MS);
-    let wallet_balance_live = wallet_status.is_some();
+    let wallet_balance_live = wallet_status.is_some_and(wallet_status_balance_is_authoritative);
     let wallet_runtime_status = wallet_status
         .map(|report| report.runtime_status.clone())
         .or_else(|| ledger.wallet.runtime_status.clone());
     let wallet_balance = wallet_status
+        .filter(|report| wallet_status_balance_is_authoritative(report))
         .map(|report| report.balance.clone())
         .or_else(|| {
             ledger
@@ -4432,9 +4463,11 @@ fn compute_operator_panel_stats_at(
         .settlements
         .iter()
         .filter(|settlement| settlement.direction == "provider")
-        .filter(|settlement| settlement.status == "settled")
-        .filter(|settlement| settlement.updated_at_ms >= since_ms)
-        .count() as u64;
+        .filter(|settlement| provider_settlement_counted_as_settled(settlement.status.as_str()))
+        .filter(|settlement| settlement.created_at_ms >= since_ms)
+        .map(|settlement| settlement.job_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len() as u64;
     let session_earnings_sats = ledger
         .wallet
         .payments
@@ -4451,15 +4484,15 @@ fn compute_operator_panel_stats_at(
         .settlements
         .iter()
         .filter(|settlement| settlement.direction == "provider")
-        .filter(|settlement| settlement.status == "settled")
-        .filter(|settlement| settlement.updated_at_ms >= since_ms)
+        .filter(|settlement| provider_settlement_counted_as_settled(settlement.status.as_str()))
+        .filter(|settlement| settlement.created_at_ms >= since_ms)
         .map(|settlement| settlement.amount_msats / 1_000)
         .sum::<u64>();
     let settled_sats_lifetime = ledger
         .settlements
         .iter()
         .filter(|settlement| settlement.direction == "provider")
-        .filter(|settlement| settlement.status == "settled")
+        .filter(|settlement| provider_settlement_counted_as_settled(settlement.status.as_str()))
         .map(|settlement| settlement.amount_msats / 1_000)
         .sum::<u64>();
     let total_earnings_sats = wallet_balance
@@ -4737,6 +4770,14 @@ fn provider_job_is_in_progress(status: &str) -> bool {
     )
 }
 
+fn wallet_status_balance_is_authoritative(report: &pylon::WalletStatusReport) -> bool {
+    report.runtime_status == "connected" || report.balance.total_sats > 0
+}
+
+fn provider_settlement_counted_as_settled(status: &str) -> bool {
+    matches!(status, "settled" | "payment_received")
+}
+
 fn latest_provider_job_status(ledger: &pylon::PylonLedger) -> Option<String> {
     ledger
         .jobs
@@ -4865,6 +4906,25 @@ fn collect_gemma4_backend_models(backend: &ProviderBackendHealth, models: &mut V
     for model in &backend.available_models {
         if is_gemma4_model(model.as_str()) {
             models.push(model.clone());
+        }
+    }
+}
+
+fn gemma_runtime_ready_models(loaded: Option<&LoadedState>) -> Vec<String> {
+    let Some(snapshot) = loaded.and_then(|loaded| loaded.snapshot.as_ref()) else {
+        return Vec::new();
+    };
+    let mut models = Vec::new();
+    collect_gemma4_backend_ready_models(&snapshot.availability.local_gemma, &mut models);
+    collect_gemma4_backend_ready_models(&snapshot.availability.apple_foundation_models, &mut models);
+    sort_and_dedup(&mut models);
+    models
+}
+
+fn collect_gemma4_backend_ready_models(backend: &ProviderBackendHealth, models: &mut Vec<String>) {
+    if let Some(model) = backend.ready_model.as_deref() {
+        if is_gemma4_model(model) {
+            models.push(model.to_string());
         }
     }
 }
@@ -5429,6 +5489,7 @@ mod tests {
     #[test]
     fn operator_panel_shows_balance_and_24h_counters() {
         let mut app = AppShell::new(PathBuf::from("/tmp/pylon-test"));
+        app.last_refresh_at = Some(Instant::now());
         app.operator_stats = OperatorPanelStats {
             desired_mode: ProviderDesiredMode::Online,
             runtime_status: Some("online".to_string()),
@@ -5577,6 +5638,62 @@ mod tests {
     }
 
     #[test]
+    fn compute_operator_panel_stats_uses_retained_balance_until_live_balance_is_authoritative() {
+        let now_ms = 1_762_700_500_000_u64;
+        let mut ledger = pylon::PylonLedger::default();
+        ledger.wallet.last_balance_sats = Some(377);
+
+        let wallet_status = pylon::WalletStatusReport {
+            runtime: pylon::WalletRuntimeSurface::default(),
+            runtime_status: "disconnected".to_string(),
+            runtime_detail: Some("syncing".to_string()),
+            balance: pylon::WalletBalanceSnapshot::default(),
+            recent_payments: Vec::new(),
+        };
+
+        let stats = compute_operator_panel_stats_at(
+            ProviderDesiredMode::Online,
+            true,
+            Some(&wallet_status),
+            None,
+            &ledger,
+            0,
+            now_ms,
+        );
+
+        assert!(!stats.wallet_balance_live);
+        assert_eq!(
+            stats.wallet_balance.as_ref().map(|balance| balance.total_sats),
+            Some(377)
+        );
+    }
+
+    #[test]
+    fn model_panel_separates_runtime_ready_from_optional_cache_entries() {
+        let mut app = AppShell::new(PathBuf::from("/tmp/pylon-test"));
+        let mut snapshot = ProviderPersistedSnapshot::default();
+        snapshot.availability.local_gemma.ready_model = Some("gemma4:e4b".to_string());
+        snapshot
+            .availability
+            .local_gemma
+            .available_models = vec!["gemma4:e4b".to_string()];
+        app.loaded = Some(super::LoadedState {
+            snapshot: Some(snapshot),
+            wallet_status: None,
+        });
+
+        let models = app
+            .model_lines()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(models.contains("runtime ready: gemma4:e4b"));
+        assert!(models.contains("gemma-4-e4b  missing"));
+    }
+
+    #[test]
     fn operator_panel_marks_run_activity_and_payment_waits_honestly() {
         let mut app = AppShell::new(PathBuf::from("/tmp/pylon-test"));
         let (state, detail) = app.operator_state_label_and_detail();
@@ -5586,7 +5703,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|value| value.contains("Starting local checks"))
         );
-
         app.operator_stats = OperatorPanelStats {
             desired_mode: ProviderDesiredMode::Online,
             runtime_status: Some("online".to_string()),
@@ -5982,6 +6098,53 @@ mod tests {
     }
 
     #[test]
+    fn compute_operator_panel_stats_counts_paid_settlements_by_created_time() {
+        let now_ms = 1_762_700_500_000_u64;
+        let mut ledger = pylon::PylonLedger::default();
+
+        let mut paid =
+            pylon::PylonLedgerJob::new("job-paid", "provider", 5050, "completed_local");
+        paid.created_at_ms = now_ms - 5_000;
+        paid.updated_at_ms = now_ms - 4_000;
+        ledger.jobs = vec![paid];
+
+        ledger.settlements.push(pylon::PylonSettlementRecord {
+            settlement_id: "settlement-paid".to_string(),
+            job_id: "job-paid".to_string(),
+            direction: "provider".to_string(),
+            status: "payment_received".to_string(),
+            amount_msats: 42_000,
+            payment_reference: Some("payment-paid".to_string()),
+            receipt_detail: Some("invoice completed in local wallet".to_string()),
+            created_at_ms: now_ms - 1_000,
+            updated_at_ms: now_ms,
+        });
+        ledger.settlements.push(pylon::PylonSettlementRecord {
+            settlement_id: "settlement-old".to_string(),
+            job_id: "job-old".to_string(),
+            direction: "provider".to_string(),
+            status: "settled".to_string(),
+            amount_msats: 21_000,
+            payment_reference: Some("payment-old".to_string()),
+            receipt_detail: Some("older settlement".to_string()),
+            created_at_ms: now_ms - super::LOOKBACK_WINDOW_24H_MS - 1,
+            updated_at_ms: now_ms,
+        });
+
+        let stats = compute_operator_panel_stats_at(
+            ProviderDesiredMode::Online,
+            true,
+            None,
+            None,
+            &ledger,
+            0,
+            now_ms,
+        );
+
+        assert_eq!(stats.jobs_settled_24h, 1);
+    }
+
+    #[test]
     fn provider_presence_only_publishes_while_explicitly_online() {
         let snapshot = ProviderPersistedSnapshot::default();
 
@@ -6253,6 +6416,27 @@ mod tests {
 
         assert!(app.transcript_max_scroll_y > 0);
         assert_eq!(app.transcript_scroll_y, app.transcript_max_scroll_y);
+    }
+
+    #[test]
+    fn transcript_follow_latest_advances_immediately_when_new_output_arrives() {
+        let mut app = AppShell::new(PathBuf::from("/tmp/pylon-test"));
+        app.update_transcript_layout(Rect::new(0, 0, 40, 10));
+        for index in 0..20 {
+            app.push_system_message("Wallet", format!("older output line {index}"));
+        }
+
+        let previous_max = app.transcript_max_scroll_y;
+        assert_eq!(app.transcript_scroll_y, previous_max);
+
+        app.push_system_message(
+            "Wallet Error",
+            "failed to send spark payment: invoice may already be paid",
+        );
+
+        assert!(app.transcript_max_scroll_y > previous_max);
+        assert_eq!(app.transcript_scroll_y, app.transcript_max_scroll_y);
+        assert!(app.transcript_panel_title() == "Transcript");
     }
 
     #[test]

@@ -53,6 +53,37 @@ All scripts are in `scripts/deploy/nexus/`.
 scripts/deploy/nexus/01-build-and-push-image.sh
 ```
 
+The Nexus image build is now an explicit hotfix lane:
+
+- it stages a Nexus-only source context instead of submitting the whole repo
+- it fills non-Nexus workspace members in that staged context with lightweight
+  placeholders so Cargo can still resolve the workspace without the full repo
+- the Docker build now uses BuildKit registry cache, cache mounts, and
+  optional GCS-backed `sccache`
+- the default build profile is now `fast-release`
+
+`sccache` remains optional. The default hotfix lane leaves it off until the
+Cloud Build path is proven stable with it enabled:
+
+```bash
+NEXUS_BUILD_SCCACHE_ENABLED=true scripts/deploy/nexus/01-build-and-push-image.sh
+```
+
+Use the normal production-optimized profile explicitly when you want it:
+
+```bash
+NEXUS_BUILD_PROFILE=release scripts/deploy/nexus/01-build-and-push-image.sh
+```
+
+For isolated validation lanes, publish a unique image tag without moving
+`latest`:
+
+```bash
+NEXUS_IMAGE_TAG=nexus-hotfix-lane-$(date -u +%Y%m%d-%H%M%S) \
+NEXUS_BUILD_UPDATE_LATEST_TAG=false \
+scripts/deploy/nexus/01-build-and-push-image.sh
+```
+
 2. Provision the baseline VM, service account, persistent disk, and IAP SSH access.
 
 ```bash
@@ -63,6 +94,23 @@ scripts/deploy/nexus/02-provision-baseline.sh
 
 ```bash
 scripts/deploy/nexus/03-configure-and-start.sh
+```
+
+If the change is config-only and you want to keep the current image:
+
+```bash
+scripts/deploy/nexus/03-refresh-config-and-restart.sh
+```
+
+`03-configure-and-start.sh` now also installs the treasury continuity watchdog
+by default and runs a post-restart payout smoke check before it leaves a new
+image in production. If the fresh image fails to emit completed payout sends
+inside the configured smoke window, the script automatically rolls back to the
+previous image. If you need to install or refresh only the watchdog without
+redeploying the Nexus container:
+
+```bash
+scripts/deploy/nexus/10-install-treasury-watchdog.sh
 ```
 
 4. Verify health and emit a deploy receipt.
@@ -77,6 +125,10 @@ the rollout if:
 - the VM or `nexus-relay` systemd service is not healthy
 - `/healthz`, `/api/stats`, or `/v1/treasury/status` latency regresses past the
   configured thresholds
+- `/api/training/rollout` latency regresses past the configured threshold or
+  the rollout-policy snapshot cannot be captured in the deploy receipt
+- repeated local-origin probes show bad tail latency on `/healthz`,
+  `/api/stats`, or `/api/provider-presence/heartbeat?dry_run=true`
 - treasury policy on the live status surface drifts from
   `/etc/nexus-relay/nexus-relay.env`
 - treasury snapshot freshness or wallet-sync freshness crosses the configured
@@ -90,10 +142,32 @@ Optional local threshold overrides:
 VERIFY_HEALTH_LATENCY_MAX_MS=1000 \
 VERIFY_STATS_LATENCY_MAX_MS=1000 \
 VERIFY_TREASURY_LATENCY_MAX_MS=1000 \
+VERIFY_LATENCY_SAMPLE_COUNT=40 \
+VERIFY_HEALTH_LATENCY_P95_MAX_MS=1000 \
+VERIFY_HEALTH_LATENCY_P99_MAX_MS=2000 \
+VERIFY_STATS_LATENCY_P95_MAX_MS=1000 \
+VERIFY_STATS_LATENCY_P99_MAX_MS=2000 \
+VERIFY_TRAINING_ROLLOUT_LATENCY_MAX_MS=1000 \
+VERIFY_PROVIDER_PRESENCE_LATENCY_P95_MAX_MS=1000 \
+VERIFY_PROVIDER_PRESENCE_LATENCY_P99_MAX_MS=2000 \
 VERIFY_TREASURY_SNAPSHOT_MAX_AGE_MS=15000 \
 VERIFY_TREASURY_WALLET_SYNC_MAX_LAG_MS=15000 \
 scripts/deploy/nexus/04-verify-gates.sh
 ```
+
+The provider-presence probe now uses `dry_run=true` so deploy verification hits
+the real heartbeat handler without polluting live public pylon counts.
+
+The deploy receipt also captures the current `/api/training/rollout` policy
+snapshot so operators can see the active rollout revision, pause state, cohort
+count, and blocked build or release breakers in the same artifact as the
+latency gates.
+
+Before crowd expansion, treat
+`docs/plans/transcript-222-training-launch-slos.md` as the normative threshold
+sheet for those gates and
+`docs/plans/transcript-222-training-incident-taxonomy.md` as the containment
+taxonomy when one of them breaks.
 
 ## 4) Runtime model
 
@@ -127,14 +201,69 @@ Treasury deployment note:
 - `scripts/deploy/nexus/03-configure-and-start.sh` preserves the live
   `NEXUS_CONTROL_TREASURY_*` values from `/etc/nexus-relay/nexus-relay.env`
   unless you explicitly export replacements before redeploying
+- `scripts/deploy/nexus/03-refresh-config-and-restart.sh` is the supported
+  config-only path when the image is unchanged and you only want to rewrite the
+  VM env/config files before restarting the service
 - set payout policy via env before running `03-configure-and-start.sh`, for example:
+  also set the runtime wallet refresh and send-concurrency envs explicitly in
+  production so payout cadence does not degrade as the eligible target count
+  grows:
 
 ```bash
 export NEXUS_CONTROL_TREASURY_ENABLED=true
-export NEXUS_CONTROL_TREASURY_PAYOUT_SATS_PER_WINDOW=2
-export NEXUS_CONTROL_TREASURY_PAYOUT_INTERVAL_SECONDS=20
+export NEXUS_CONTROL_TREASURY_PAYOUT_SATS_PER_WINDOW=25
+export NEXUS_CONTROL_TREASURY_PAYOUT_INTERVAL_SECONDS=600
 export NEXUS_CONTROL_TREASURY_REQUIRE_SELLABLE=true
 export NEXUS_CONTROL_TREASURY_DAILY_BUDGET_CAP_SATS=1000000
+export NEXUS_CONTROL_TREASURY_WALLET_STATUS_REFRESH_SECONDS=30
+export NEXUS_CONTROL_TREASURY_MAX_CONCURRENT_SENDS=4
+```
+
+Why the extra two envs matter:
+
+- `NEXUS_CONTROL_TREASURY_WALLET_STATUS_REFRESH_SECONDS=30` keeps the wallet
+  refresh loop on a lighter background cadence in production; treasury stale
+  detection now tracks that configured refresh budget and the stats refresh
+  path uses cached wallet balance plus bounded recent payment history instead
+  of forcing a full Spark sync or full wallet-history walk every cycle
+- if `${NEXUS_CONTROL_TREASURY_STATE_PATH}` picks up a malformed cached
+  snapshot during a restart, the runtime now attempts to recover from the
+  remaining state and at minimum preserves the persisted payout total rather
+  than silently zeroing the public counter
+- `NEXUS_CONTROL_TREASURY_PAYOUT_SATS_PER_WINDOW=25` and
+  `NEXUS_CONTROL_TREASURY_PAYOUT_INTERVAL_SECONDS=600` are the current
+  production-safe reference values for the hosted Nexus treasury. That policy
+  reduces Spark transfer pressure to `0.4` sends/second even if the eligible
+  set reaches `240` providers, while keeping the daily ceiling under
+  `864000 sats` at that scale.
+- `NEXUS_CONTROL_TREASURY_MAX_CONCURRENT_SENDS=4` caps the per-cycle Spark
+  fan-out so one stalled upstream batch cannot occupy all live payout slots at
+  once.
+- `scripts/deploy/nexus/10-install-treasury-watchdog.sh` installs a systemd
+  timer on the VM that runs every 5 minutes, checks the local treasury status
+  plus recent completed-send journal entries, and restarts `nexus-relay` only
+  when payouts have actually gone idle or the wallet/runtime has entered a hard
+  error state
+- the watchdog now has a startup grace window so it does not restart
+  `nexus-relay` based on stale pre-restart dispatch timestamps before the first
+  post-restart payout window can complete
+- `03-configure-and-start.sh` now refuses to leave a new image live unless it
+  produces fresh completed payout sends after restart; otherwise it rolls back
+  automatically to the previous image
+
+Watchdog env overrides:
+
+```bash
+export NEXUS_TREASURY_WATCHDOG_ENABLED=true
+export NEXUS_TREASURY_WATCHDOG_INTERVAL_SECONDS=300
+export NEXUS_TREASURY_WATCHDOG_MAX_IDLE_SECONDS=300
+export NEXUS_TREASURY_WATCHDOG_MAX_CONFIRM_LAG_SECONDS=300
+export NEXUS_TREASURY_WATCHDOG_MAX_RESTARTS_PER_HOUR=12
+export NEXUS_TREASURY_WATCHDOG_STARTUP_GRACE_SECONDS=180
+export NEXUS_DEPLOY_POST_RESTART_SMOKE_ENABLED=true
+export NEXUS_DEPLOY_POST_RESTART_SMOKE_TIMEOUT_SECONDS=360
+export NEXUS_DEPLOY_POST_RESTART_WARMUP_GRACE_SECONDS=180
+export NEXUS_DEPLOY_POST_RESTART_SMOKE_POLL_SECONDS=10
 ```
 
 If treasury status ever collapses to `0 sats` unexpectedly after a backend or

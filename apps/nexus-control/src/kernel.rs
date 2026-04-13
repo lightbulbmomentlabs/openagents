@@ -51,18 +51,22 @@ use openagents_kernel_core::compute::{
     ComputeProduct, ComputeProductStatus, ComputeRegistryStatus, ComputeSettlementFailureReason,
     ComputeSyntheticDataJob, ComputeSyntheticDataJobStatus, ComputeSyntheticDataSample,
     ComputeSyntheticDataSampleStatus, ComputeTrainingPolicy, ComputeTrainingRun,
-    ComputeTrainingRunStatus, ComputeValidatorPolicy, DeliveryProof, DeliveryProofStatus,
-    DeliveryRejectionReason, StructuredCapacityInstrument, StructuredCapacityInstrumentKind,
+    ComputeTrainingRunDefinition, ComputeTrainingRunDefinitionBenchmarkPackage,
+    ComputeTrainingRunDefinitionDatasetBinding, ComputeTrainingRunDefinitionEnvironment,
+    ComputeTrainingRunDefinitionReferenceFamilies, ComputeTrainingRunStatus,
+    ComputeValidatorPolicy, DeliveryProof, DeliveryProofStatus, DeliveryRejectionReason,
+    StructuredCapacityInstrument, StructuredCapacityInstrumentKind,
     StructuredCapacityInstrumentStatus, StructuredCapacityLegRole, canonical_compute_product_id,
     compute_apple_benchmark_package_metadata, compute_apple_training_run_metadata,
-    validate_compute_accepted_outcome, validate_compute_adapter_contribution_outcome,
-    validate_compute_adapter_training_window, validate_compute_benchmark_package,
-    validate_compute_capability_envelope, validate_compute_checkpoint_family_policy,
-    validate_compute_environment_package, validate_compute_evaluation_artifact,
-    validate_compute_evaluation_run, validate_compute_evaluation_sample,
-    validate_compute_synthetic_data_job, validate_compute_synthetic_data_sample,
-    validate_compute_training_policy, validate_compute_training_run,
-    validate_compute_validator_policy, validate_delivery_proof, validate_launch_compute_product,
+    compute_training_run_definition_metadata, validate_compute_accepted_outcome,
+    validate_compute_adapter_contribution_outcome, validate_compute_adapter_training_window,
+    validate_compute_benchmark_package, validate_compute_capability_envelope,
+    validate_compute_checkpoint_family_policy, validate_compute_environment_package,
+    validate_compute_evaluation_artifact, validate_compute_evaluation_run,
+    validate_compute_evaluation_sample, validate_compute_synthetic_data_job,
+    validate_compute_synthetic_data_sample, validate_compute_training_policy,
+    validate_compute_training_run, validate_compute_validator_policy, validate_delivery_proof,
+    validate_launch_compute_product,
 };
 use openagents_kernel_core::data::{
     AccessGrant, AccessGrantStatus, DataAsset, DataAssetStatus, DataMarketSnapshot, DeliveryBundle,
@@ -77,6 +81,11 @@ use openagents_kernel_core::liquidity::{
     Envelope, EnvelopeStatus, Quote, QuoteStatus, ReservePartition, ReservePartitionStatus,
     RoutePlan, RoutePlanStatus, SettlementIntent, SettlementIntentStatus,
 };
+use openagents_kernel_core::pylon_training::{
+    PylonTrainingArtifactGcsLayoutPolicy, PylonTrainingArtifactResolverResponse,
+    pylon_training_artifact_gcs_layout_policy, pylon_training_hard_gate_reason,
+    pylon_training_resolve_artifact_id,
+};
 use openagents_kernel_core::receipts::{
     Asset, EvidenceRef, Money, MoneyAmount, PolicyContext, Receipt, ReceiptBuilder, ReceiptHints,
     ReceiptRef, TraceContext,
@@ -89,10 +98,14 @@ use openagents_kernel_core::snapshots::{
     ComputeBreakerStatusRow, ComputeRolloutGateRow, ComputeTruthLabelRow, EconomySnapshot,
 };
 use openagents_kernel_core::time::{floor_to_minute_utc, snapshot_id_for_minute};
+use openagents_provider_substrate::{
+    ProviderAdapterTrainingContributorAvailability, ProviderHostTelemetrySnapshot,
+    ProviderTrainingCapabilityEnvelopeV2, ProviderTrainingCapabilityTierProfile,
+};
 use openagents_validator_service::{
     ValidatorChallengeLease, ValidatorChallengeRequest, ValidatorChallengeResult,
     ValidatorChallengeService, ValidatorChallengeSnapshot, ValidatorChallengeStatus,
-    ValidatorServiceError,
+    ValidatorChallengeVerdict, ValidatorServiceError,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -111,6 +124,8 @@ const COMPUTE_PROVIDER_CONCENTRATION_GUARDED_HHI: f64 = 0.35;
 const COMPUTE_PROVIDER_CONCENTRATION_TRIPPED_HHI: f64 = 0.60;
 const COMPUTE_DELIVERY_REJECTION_GUARDED_RATE: f64 = 0.10;
 const COMPUTE_DELIVERY_REJECTION_TRIPPED_RATE: f64 = 0.25;
+const TRAINING_NODE_HEARTBEAT_INTERVAL_MS: i64 = 5_000;
+const TRAINING_NODE_HEARTBEAT_STALE_AFTER_MS: i64 = 120_000;
 
 #[derive(Debug, Clone)]
 pub struct ComputeRuntimePolicy {
@@ -369,6 +384,7 @@ pub struct KernelState {
     compute_evaluation_runs: HashMap<String, ComputeEvaluationRunRecord>,
     compute_evaluation_samples: HashMap<String, ComputeEvaluationSampleRecord>,
     compute_training_runs: HashMap<String, ComputeTrainingRunRecord>,
+    admitted_training_nodes: HashMap<String, AdmittedTrainingNodeRecord>,
     compute_adapter_training_windows: HashMap<String, ComputeAdapterTrainingWindowRecord>,
     compute_adapter_contribution_outcomes: HashMap<String, ComputeAdapterContributionOutcomeRecord>,
     compute_accepted_outcomes: HashMap<String, ComputeAcceptedOutcomeRecord>,
@@ -379,6 +395,9 @@ pub struct KernelState {
     structured_capacity_instruments: HashMap<String, StructuredCapacityInstrumentRecord>,
     delivery_proofs: HashMap<String, DeliveryProofRecord>,
     validator_challenges: ValidatorChallengeService,
+    training_trn_publications: HashMap<String, TrainingTrnPublicationPointer>,
+    training_trn_publication_records: HashMap<String, TrainingTrnPublicationRecord>,
+    training_validator_challenge_receipts: HashMap<String, TrainingValidatorChallengeReceiptRecord>,
     compute_indices: HashMap<String, ComputeIndexRecord>,
     data_assets: HashMap<String, DataAssetRecord>,
     access_grants: HashMap<String, AccessGrantRecord>,
@@ -470,6 +489,344 @@ struct ComputeEvaluationSampleRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ComputeTrainingRunRecord {
     training_run: ComputeTrainingRun,
+    receipt_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingTrnPublicationPointer {
+    pub publication_key: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub event_kind: u32,
+    pub event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_ref: Option<String>,
+    pub published_at_ms: i64,
+    pub fingerprint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingTrnRelayPublicationOutcome {
+    pub relay_url: String,
+    pub accepted: bool,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingTrnPublicationTemplate {
+    pub event_kind: u16,
+    pub tags: Vec<Vec<String>>,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingTrnPublicationRecord {
+    pub publication_key: String,
+    pub subject_kind: String,
+    pub subject_id: String,
+    pub event_kind: u32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub a_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub published_at_ms: Option<i64>,
+    pub last_attempt_at_ms: i64,
+    #[serde(default)]
+    pub attempt_count: u32,
+    #[serde(default)]
+    pub pending_retry: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_outcomes: Vec<TrainingTrnRelayPublicationOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<TrainingTrnPublicationTemplate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrainingValidatorChallengeReceiptRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finalization_receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    node_pubkey_hex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    finalized_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    status: Option<ValidatorChallengeStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verdict: Option<ValidatorChallengeVerdict>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainingValidatorChallengeFinalizationSource {
+    pub challenge_id: String,
+    pub finalization_receipt_id: String,
+    pub node_pubkey_hex: String,
+    pub finalized_at_ms: i64,
+    pub status: ValidatorChallengeStatus,
+    pub verdict: ValidatorChallengeVerdict,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComputeTrainingRunPublicationSource {
+    pub training_run: ComputeTrainingRun,
+    pub receipt_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComputeTrainingWindowPublicationSource {
+    pub window: ComputeAdapterTrainingWindow,
+    pub receipt_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ComputeAcceptedOutcomePublicationSource {
+    pub outcome: ComputeAcceptedOutcome,
+    pub receipt_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingNodeRoleClaim {
+    Worker,
+    Validator,
+    RecoverySource,
+}
+
+impl TrainingNodeRoleClaim {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Validator => "validator",
+            Self::RecoverySource => "recovery_source",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "worker" => Some(Self::Worker),
+            "validator" => Some(Self::Validator),
+            "recovery_source" => Some(Self::RecoverySource),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingNodeDesiredState {
+    Running,
+    Draining,
+    Stopped,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingNodeProcessState {
+    Launching,
+    Running,
+    Draining,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingCoordinatorAck {
+    pub idempotency_key: String,
+    pub recorded_at_ms: i64,
+    pub authority_state: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RecordTrainingNodeAdmissionRequest {
+    pub idempotency_key: String,
+    pub requested_at_ms: i64,
+    pub node_pubkey_hex: String,
+    pub release_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_label: Option<String>,
+    #[serde(default)]
+    pub role_claims: Vec<TrainingNodeRoleClaim>,
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_digest: Option<String>,
+    #[serde(default)]
+    pub contributor_availability: ProviderAdapterTrainingContributorAvailability,
+    #[serde(default)]
+    pub capability_tier: ProviderTrainingCapabilityTierProfile,
+    #[serde(default)]
+    pub capability_envelope_v2: ProviderTrainingCapabilityEnvelopeV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_telemetry: Option<ProviderHostTelemetrySnapshot>,
+    #[serde(default)]
+    pub active_reputation_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_destination: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecordTrainingNodeAdmissionResponse {
+    pub ack: TrainingCoordinatorAck,
+    pub admission_id: String,
+    pub admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecordTrainingNodeHeartbeatRequest {
+    pub idempotency_key: String,
+    pub recorded_at_ms: i64,
+    pub node_pubkey_hex: String,
+    pub build_digest: String,
+    pub training_run_id: String,
+    pub window_id: String,
+    pub assignment_id: String,
+    pub lease_id: String,
+    pub desired_state: TrainingNodeDesiredState,
+    pub process_state: TrainingNodeProcessState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RecordTrainingNodeHeartbeatResponse {
+    pub ack: TrainingCoordinatorAck,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_heartbeat_due_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_state: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TrainingNodeQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<TrainingNodeRoleClaim>,
+    #[serde(default)]
+    pub online_only: bool,
+    #[serde(default)]
+    pub eligible_only: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AdmittedTrainingNode {
+    pub admission_id: String,
+    pub node_pubkey_hex: String,
+    pub release_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_label: Option<String>,
+    #[serde(default)]
+    pub role_claims: Vec<TrainingNodeRoleClaim>,
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
+    pub build_digest: String,
+    pub contributor_availability: ProviderAdapterTrainingContributorAvailability,
+    #[serde(default)]
+    pub capability_tier: ProviderTrainingCapabilityTierProfile,
+    #[serde(default)]
+    pub capability_envelope_v2: ProviderTrainingCapabilityEnvelopeV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_telemetry: Option<ProviderHostTelemetrySnapshot>,
+    #[serde(default)]
+    pub active_reputation_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_destination: Option<String>,
+    pub admitted_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_training_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assignment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_desired_state: Option<TrainingNodeDesiredState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_process_state: Option<TrainingNodeProcessState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_window_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AdmittedTrainingNodeView {
+    pub admission_id: String,
+    pub node_pubkey_hex: String,
+    pub release_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_label: Option<String>,
+    #[serde(default)]
+    pub role_claims: Vec<TrainingNodeRoleClaim>,
+    #[serde(default)]
+    pub allowed_networks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_version: Option<String>,
+    pub build_digest: String,
+    pub contributor_availability: ProviderAdapterTrainingContributorAvailability,
+    #[serde(default)]
+    pub capability_tier: ProviderTrainingCapabilityTierProfile,
+    #[serde(default)]
+    pub capability_envelope_v2: ProviderTrainingCapabilityEnvelopeV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_memory_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_disk_gb: Option<u64>,
+    #[serde(default)]
+    pub active_reputation_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_destination: Option<String>,
+    pub admitted_at_ms: i64,
+    pub updated_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_heartbeat_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_training_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_window_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assignment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_lease_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_desired_state: Option<TrainingNodeDesiredState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_process_state: Option<TrainingNodeProcessState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_successful_window_id: Option<String>,
+    pub online: bool,
+    pub eligible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AdmittedTrainingNodeRecord {
+    node: AdmittedTrainingNode,
     receipt_id: String,
 }
 
@@ -602,6 +959,8 @@ struct PersistedComputeAuthorityState {
     #[serde(default)]
     compute_training_runs: BTreeMap<String, ComputeTrainingRunRecord>,
     #[serde(default)]
+    admitted_training_nodes: BTreeMap<String, AdmittedTrainingNodeRecord>,
+    #[serde(default)]
     compute_adapter_training_windows: BTreeMap<String, ComputeAdapterTrainingWindowRecord>,
     #[serde(default)]
     compute_adapter_contribution_outcomes:
@@ -619,6 +978,13 @@ struct PersistedComputeAuthorityState {
     delivery_proofs: BTreeMap<String, DeliveryProofRecord>,
     #[serde(default)]
     validator_challenges: ValidatorChallengeService,
+    #[serde(default)]
+    training_trn_publications: BTreeMap<String, TrainingTrnPublicationPointer>,
+    #[serde(default)]
+    training_trn_publication_records: BTreeMap<String, TrainingTrnPublicationRecord>,
+    #[serde(default)]
+    training_validator_challenge_receipts:
+        BTreeMap<String, TrainingValidatorChallengeReceiptRecord>,
     compute_indices: BTreeMap<String, ComputeIndexRecord>,
     snapshots: BTreeMap<i64, EconomySnapshot>,
     next_projection_seq: u64,
@@ -816,6 +1182,26 @@ pub struct FinalizeValidatorChallengeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FinalizeValidatorChallengeResponse {
+    pub challenge: ValidatorChallengeSnapshot,
+    pub receipt: Receipt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryValidatorChallengeRequest {
+    pub idempotency_key: String,
+    pub trace: TraceContext,
+    pub policy: PolicyContext,
+    pub lease: ValidatorChallengeLease,
+    pub finalized_at_ms: u64,
+    pub detail: String,
+    #[serde(default)]
+    pub evidence: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub hints: ReceiptHints,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryValidatorChallengeResponse {
     pub challenge: ValidatorChallengeSnapshot,
     pub receipt: Receipt,
 }
@@ -2500,6 +2886,104 @@ impl KernelState {
             })
     }
 
+    pub fn get_compute_training_run_definition(
+        &self,
+        training_policy_ref: &str,
+        version: Option<&str>,
+    ) -> Result<ComputeTrainingRunDefinition, String> {
+        let policy = self
+            .get_compute_training_policy(training_policy_ref, version)
+            .ok_or_else(|| "kernel_compute_training_policy_not_found".to_string())?;
+        let metadata = compute_training_run_definition_metadata(&policy)?
+            .ok_or_else(|| "compute_training_run_definition_metadata_missing".to_string())?;
+        let validator_policy = self
+            .get_compute_validator_policy(policy.validator_policy_ref.as_str(), None)
+            .ok_or_else(|| "kernel_compute_validator_policy_not_found".to_string())?;
+
+        let mut environments = Vec::with_capacity(policy.environment_refs.len());
+        let mut dataset_bindings = Vec::new();
+        for environment_ref in &policy.environment_refs {
+            let environment = self
+                .get_compute_environment_package(environment_ref.as_str(), None)
+                .ok_or_else(|| "kernel_compute_environment_package_not_found".to_string())?;
+            for binding in &environment.dataset_bindings {
+                dataset_bindings.push(ComputeTrainingRunDefinitionDatasetBinding {
+                    environment_ref: environment.environment_ref.clone(),
+                    environment_version: environment.version.clone(),
+                    dataset_ref: binding.dataset_ref.clone(),
+                    split_ref: binding.split_ref.clone(),
+                    mount_path: binding.mount_path.clone(),
+                    integrity_ref: binding.integrity_ref.clone(),
+                    access_policy_ref: binding.access_policy_ref.clone(),
+                    required: binding.required,
+                    metadata: binding.metadata.clone(),
+                });
+            }
+            environments.push(ComputeTrainingRunDefinitionEnvironment {
+                environment_ref: environment.environment_ref.clone(),
+                version: environment.version.clone(),
+                family: environment.family.clone(),
+                display_name: Some(environment.display_name.clone()),
+                package_digest: environment.package_digest.clone(),
+                dataset_bindings: environment.dataset_bindings.clone(),
+                policy_refs: environment.policy_refs.clone(),
+            });
+        }
+
+        let mut benchmark_packages = Vec::with_capacity(policy.benchmark_package_refs.len());
+        for benchmark_package_ref in &policy.benchmark_package_refs {
+            let package = self
+                .get_compute_benchmark_package(benchmark_package_ref.as_str(), None)
+                .ok_or_else(|| "kernel_compute_benchmark_package_not_found".to_string())?;
+            benchmark_packages.push(ComputeTrainingRunDefinitionBenchmarkPackage {
+                benchmark_package_ref: package.benchmark_package_ref.clone(),
+                version: package.version.clone(),
+                family: package.family.clone(),
+                environment_ref: package.environment_ref.clone(),
+                environment_version: package.environment_version.clone(),
+                artifact_refs: package.artifact_refs.clone(),
+            });
+        }
+
+        Ok(ComputeTrainingRunDefinition {
+            schema_version: metadata.abi_version.clone(),
+            run_definition_ref: metadata.run_definition_ref,
+            training_policy_ref: policy.training_policy_ref.clone(),
+            training_policy_version: policy.version.clone(),
+            training_family: metadata.training_family,
+            objective: metadata.objective,
+            sync_profile: metadata.sync_profile,
+            checkpoint_family: policy.checkpoint_family.clone(),
+            validator_policy_ref: validator_policy.policy_ref.clone(),
+            validator_policy_version: Some(validator_policy.version.clone()),
+            dataset_identity: metadata.dataset_identity,
+            dataset_slice_family: metadata.dataset_slice_family,
+            page_proof_family: metadata.page_proof_family,
+            benchmark_package_set_ref: metadata.benchmark_package_set_ref,
+            version_semantics: metadata.version_semantics,
+            environments,
+            dataset_bindings,
+            benchmark_packages,
+            reference_families: ComputeTrainingRunDefinitionReferenceFamilies {
+                window_ref_family: metadata.window_ref_family,
+                manifest_ref_family: metadata.manifest_ref_family,
+                trn_ref_family: metadata.trn_ref_family,
+                closeout_ref_family: metadata.closeout_ref_family,
+            },
+        })
+    }
+
+    pub fn resolve_compute_training_artifact(
+        &self,
+        artifact_id: &str,
+    ) -> Result<PylonTrainingArtifactResolverResponse, String> {
+        pylon_training_resolve_artifact_id(artifact_id)
+    }
+
+    pub fn compute_training_artifact_gcs_layout(&self) -> PylonTrainingArtifactGcsLayoutPolicy {
+        pylon_training_artifact_gcs_layout_policy()
+    }
+
     pub fn list_compute_evaluation_runs(
         &self,
         environment_ref: Option<&str>,
@@ -2580,6 +3064,329 @@ impl KernelState {
             .map(|record| record.training_run.clone())
     }
 
+    pub fn list_compute_training_run_publication_sources(
+        &self,
+    ) -> Vec<ComputeTrainingRunPublicationSource> {
+        let mut items = self
+            .compute_training_runs
+            .values()
+            .map(|record| ComputeTrainingRunPublicationSource {
+                training_run: record.training_run.clone(),
+                receipt_id: record.receipt_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            lhs.training_run
+                .created_at_ms
+                .cmp(&rhs.training_run.created_at_ms)
+                .then_with(|| {
+                    lhs.training_run
+                        .training_run_id
+                        .cmp(&rhs.training_run.training_run_id)
+                })
+        });
+        items
+    }
+
+    pub fn list_admitted_training_nodes(
+        &self,
+        query: &TrainingNodeQuery,
+        now_unix_ms: i64,
+    ) -> Vec<AdmittedTrainingNodeView> {
+        let mut items = self
+            .admitted_training_nodes
+            .values()
+            .map(|record| admitted_training_node_view(&record.node, now_unix_ms))
+            .filter(|node| {
+                training_node_matches_network(node, query.network_id.as_deref())
+                    && query
+                        .role
+                        .is_none_or(|expected| node.role_claims.contains(&expected))
+                    && (!query.online_only || node.online)
+                    && (!query.eligible_only || node.eligible)
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            rhs.updated_at_ms
+                .cmp(&lhs.updated_at_ms)
+                .then_with(|| lhs.node_pubkey_hex.cmp(&rhs.node_pubkey_hex))
+                .then_with(|| lhs.build_digest.cmp(&rhs.build_digest))
+        });
+        items
+    }
+
+    pub fn get_admitted_training_node(
+        &self,
+        node_pubkey_hex: &str,
+        now_unix_ms: i64,
+    ) -> Option<AdmittedTrainingNodeView> {
+        let node_pubkey_hex =
+            normalize_required(node_pubkey_hex, "training_node_pubkey_missing").ok()?;
+        self.admitted_training_nodes
+            .values()
+            .filter(|record| record.node.node_pubkey_hex == node_pubkey_hex)
+            .max_by(|lhs, rhs| {
+                lhs.node
+                    .updated_at_ms
+                    .cmp(&rhs.node.updated_at_ms)
+                    .then_with(|| lhs.node.build_digest.cmp(&rhs.node.build_digest))
+            })
+            .map(|record| admitted_training_node_view(&record.node, now_unix_ms))
+    }
+
+    pub fn record_training_node_admission(
+        &mut self,
+        context: &KernelMutationContext,
+        mut req: RecordTrainingNodeAdmissionRequest,
+    ) -> Result<MutationResult<RecordTrainingNodeAdmissionResponse>, String> {
+        let node_pubkey_hex =
+            normalize_required(req.node_pubkey_hex.as_str(), "training_node_pubkey_missing")?;
+        let release_id =
+            normalize_required(req.release_id.as_str(), "training_node_release_id_missing")?;
+        let build_digest = normalize_required(
+            req.build_digest.as_deref().unwrap_or_default(),
+            "training_node_build_digest_missing",
+        )?;
+        req.requested_at_ms = normalize_created_at_ms(req.requested_at_ms, context.now_unix_ms);
+        req.node_pubkey_hex.clone_from(&node_pubkey_hex);
+        req.release_id.clone_from(&release_id);
+        req.node_label = req
+            .node_label
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        req.role_claims = normalize_training_node_role_claims(req.role_claims);
+        if req.role_claims.is_empty() {
+            return Err("training_node_role_claims_missing".to_string());
+        }
+        req.allowed_networks = normalize_string_vec(req.allowed_networks);
+        req.build_version = req
+            .build_version
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        req.build_digest = Some(build_digest.clone());
+        req.active_reputation_labels = normalize_string_vec(req.active_reputation_labels);
+        req.settlement_destination = req
+            .settlement_destination
+            .take()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+
+        let registry_key =
+            training_node_registry_key(node_pubkey_hex.as_str(), build_digest.as_str());
+        let existing_record = self
+            .admitted_training_nodes
+            .get(registry_key.as_str())
+            .cloned();
+        let refusal_reason = pylon_training_hard_gate_reason(&req.active_reputation_labels);
+        let admitted =
+            req.contributor_availability.has_authoritative_state() && refusal_reason.is_none();
+        let reason = refusal_reason.or_else(|| {
+            (!req.contributor_availability.has_authoritative_state())
+                .then_some("training_node_capability_missing".to_string())
+        });
+        let admission_id = existing_record
+            .as_ref()
+            .map(|record| record.node.admission_id.clone())
+            .unwrap_or_else(|| {
+                training_node_admission_id(node_pubkey_hex.as_str(), build_digest.as_str())
+            });
+        let request_hash = request_hash(&req)?;
+        let receipt = build_receipt(
+            context,
+            req.idempotency_key.as_str(),
+            KernelReceiptSpec {
+                action: "kernel.compute.training_node.admission.record".to_string(),
+                created_at_ms: req.requested_at_ms,
+                trace: normalized_trace(TraceContext::default(), context, None, None),
+                policy: normalized_policy(PolicyContext::default(), context),
+                inputs_payload: serde_json::to_value(&req).map_err(|error| {
+                    format!("kernel_training_node_admission_encode_failed: {error}")
+                })?,
+                outputs_payload: json!({
+                    "admission_id": admission_id.clone(),
+                    "node_pubkey_hex": node_pubkey_hex.clone(),
+                    "build_digest": build_digest.clone(),
+                    "admitted": admitted,
+                    "reason": reason.clone(),
+                }),
+                evidence: Vec::new(),
+                hints: ReceiptHints::default(),
+            },
+        )?;
+        let put_result = self.receipt_store.put_receipt(
+            "kernel.compute.training_node.admission.record",
+            context.caller_id.as_str(),
+            req.idempotency_key.as_str(),
+            request_hash.as_str(),
+            receipt,
+        );
+        let response = RecordTrainingNodeAdmissionResponse {
+            ack: TrainingCoordinatorAck {
+                idempotency_key: req.idempotency_key.clone(),
+                recorded_at_ms: req.requested_at_ms,
+                authority_state: if admitted {
+                    "admitted".to_string()
+                } else {
+                    "refused".to_string()
+                },
+            },
+            admission_id: admission_id.clone(),
+            admitted,
+            reason: reason.clone(),
+        };
+        let put_result = put_result.map_err(|error| receipt_store_reason(&error).to_string())?;
+        if put_result.replayed {
+            return Ok(MutationResult {
+                response,
+                receipt_event: None,
+                snapshot_event: None,
+            });
+        }
+
+        if admitted || existing_record.is_some() {
+            let node = admitted_training_node_from_request(
+                existing_record.as_ref().map(|record| &record.node),
+                &req,
+                admission_id,
+                build_digest,
+            );
+            self.admitted_training_nodes.insert(
+                registry_key,
+                AdmittedTrainingNodeRecord {
+                    node,
+                    receipt_id: put_result.receipt.receipt_id.clone(),
+                },
+            );
+        }
+        let receipt_event = self.next_receipt_event(put_result.seq, put_result.receipt.clone());
+        let snapshot_event = self.refresh_snapshot_for(req.requested_at_ms)?;
+        Ok(MutationResult {
+            response,
+            receipt_event: Some(receipt_event),
+            snapshot_event: Some(snapshot_event),
+        })
+    }
+
+    pub fn record_training_node_heartbeat(
+        &mut self,
+        context: &KernelMutationContext,
+        mut req: RecordTrainingNodeHeartbeatRequest,
+    ) -> Result<MutationResult<RecordTrainingNodeHeartbeatResponse>, String> {
+        let node_pubkey_hex =
+            normalize_required(req.node_pubkey_hex.as_str(), "training_node_pubkey_missing")?;
+        let build_digest = normalize_required(
+            req.build_digest.as_str(),
+            "training_node_build_digest_missing",
+        )?;
+        req.recorded_at_ms = normalize_created_at_ms(req.recorded_at_ms, context.now_unix_ms);
+        req.node_pubkey_hex.clone_from(&node_pubkey_hex);
+        req.build_digest.clone_from(&build_digest);
+        req.training_run_id = normalize_required(
+            req.training_run_id.as_str(),
+            "training_node_training_run_id_missing",
+        )?;
+        req.window_id =
+            normalize_required(req.window_id.as_str(), "training_node_window_id_missing")?;
+        req.assignment_id = normalize_required(
+            req.assignment_id.as_str(),
+            "training_node_assignment_id_missing",
+        )?;
+        req.lease_id = normalize_required(req.lease_id.as_str(), "training_node_lease_id_missing")?;
+        let heartbeat_at_ms = req.last_heartbeat_at_ms.unwrap_or(req.recorded_at_ms);
+        req.last_heartbeat_at_ms = Some(heartbeat_at_ms);
+
+        let registry_key =
+            training_node_registry_key(node_pubkey_hex.as_str(), build_digest.as_str());
+        if !self
+            .admitted_training_nodes
+            .contains_key(registry_key.as_str())
+        {
+            return Err("training_node_not_found".to_string());
+        }
+        let request_hash = request_hash(&req)?;
+        let lease_state = training_node_lease_state_for(req.desired_state, req.process_state);
+        let window_state = training_node_window_state_for(req.process_state, req.last_exit_code);
+        let receipt = build_receipt(
+            context,
+            req.idempotency_key.as_str(),
+            KernelReceiptSpec {
+                action: "kernel.compute.training_node.heartbeat.record".to_string(),
+                created_at_ms: req.recorded_at_ms,
+                trace: normalized_trace(TraceContext::default(), context, None, None),
+                policy: normalized_policy(PolicyContext::default(), context),
+                inputs_payload: serde_json::to_value(&req).map_err(|error| {
+                    format!("kernel_training_node_heartbeat_encode_failed: {error}")
+                })?,
+                outputs_payload: json!({
+                    "node_pubkey_hex": node_pubkey_hex.clone(),
+                    "build_digest": build_digest.clone(),
+                    "lease_state": lease_state.clone(),
+                    "window_state": window_state.clone(),
+                    "next_heartbeat_due_at_ms": heartbeat_at_ms.saturating_add(TRAINING_NODE_HEARTBEAT_INTERVAL_MS),
+                }),
+                evidence: Vec::new(),
+                hints: ReceiptHints::default(),
+            },
+        )?;
+        let put_result = self.receipt_store.put_receipt(
+            "kernel.compute.training_node.heartbeat.record",
+            context.caller_id.as_str(),
+            req.idempotency_key.as_str(),
+            request_hash.as_str(),
+            receipt,
+        );
+        let response = RecordTrainingNodeHeartbeatResponse {
+            ack: TrainingCoordinatorAck {
+                idempotency_key: req.idempotency_key.clone(),
+                recorded_at_ms: req.recorded_at_ms,
+                authority_state: lease_state.clone(),
+            },
+            next_heartbeat_due_at_ms: Some(
+                heartbeat_at_ms.saturating_add(TRAINING_NODE_HEARTBEAT_INTERVAL_MS),
+            ),
+            lease_state: Some(lease_state.clone()),
+            window_state: Some(window_state.clone()),
+        };
+        let put_result = put_result.map_err(|error| receipt_store_reason(&error).to_string())?;
+        if put_result.replayed {
+            return Ok(MutationResult {
+                response,
+                receipt_event: None,
+                snapshot_event: None,
+            });
+        }
+
+        let record = self
+            .admitted_training_nodes
+            .get_mut(registry_key.as_str())
+            .ok_or_else(|| "training_node_not_found".to_string())?;
+        record.node.updated_at_ms = req.recorded_at_ms;
+        record.node.last_heartbeat_at_ms = Some(heartbeat_at_ms);
+        record.node.last_training_run_id = Some(req.training_run_id.clone());
+        record.node.last_window_id = Some(req.window_id.clone());
+        record.node.last_assignment_id = Some(req.assignment_id.clone());
+        record.node.last_lease_id = Some(req.lease_id.clone());
+        record.node.last_desired_state = Some(req.desired_state);
+        record.node.last_process_state = Some(req.process_state);
+        record.node.last_exit_code = req.last_exit_code;
+        if matches!(req.process_state, TrainingNodeProcessState::Stopped)
+            && req.last_exit_code == Some(0)
+        {
+            record.node.last_successful_run_id = Some(req.training_run_id);
+            record.node.last_successful_window_id = Some(req.window_id);
+        }
+        record.receipt_id = put_result.receipt.receipt_id.clone();
+        let receipt_event = self.next_receipt_event(put_result.seq, put_result.receipt.clone());
+        let snapshot_event = self.refresh_snapshot_for(req.recorded_at_ms)?;
+        Ok(MutationResult {
+            response,
+            receipt_event: Some(receipt_event),
+            snapshot_event: Some(snapshot_event),
+        })
+    }
+
     pub fn list_compute_adapter_training_windows(
         &self,
         training_run_id: Option<&str>,
@@ -2609,6 +3416,32 @@ impl KernelState {
         self.compute_adapter_training_windows
             .get(window_id)
             .map(|record| record.window.clone())
+    }
+
+    pub fn list_compute_training_window_publication_sources(
+        &self,
+        training_run_id: Option<&str>,
+        status: Option<ComputeAdapterWindowStatus>,
+    ) -> Vec<ComputeTrainingWindowPublicationSource> {
+        let mut items = self
+            .compute_adapter_training_windows
+            .values()
+            .filter(|record| {
+                training_run_id.is_none_or(|expected| record.window.training_run_id == expected)
+                    && status.is_none_or(|expected| record.window.status == expected)
+            })
+            .map(|record| ComputeTrainingWindowPublicationSource {
+                window: record.window.clone(),
+                receipt_id: record.receipt_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            lhs.window
+                .recorded_at_ms
+                .cmp(&rhs.window.recorded_at_ms)
+                .then_with(|| lhs.window.window_id.cmp(&rhs.window.window_id))
+        });
+        items
     }
 
     pub fn list_compute_adapter_contribution_outcomes(
@@ -2673,6 +3506,34 @@ impl KernelState {
         self.compute_accepted_outcomes
             .get(outcome_id)
             .map(|record| record.outcome.clone())
+    }
+
+    pub fn list_compute_accepted_outcome_publication_sources(
+        &self,
+        outcome_kind: Option<ComputeAcceptedOutcomeKind>,
+        environment_ref: Option<&str>,
+    ) -> Vec<ComputeAcceptedOutcomePublicationSource> {
+        let mut items = self
+            .compute_accepted_outcomes
+            .values()
+            .filter(|record| {
+                outcome_kind.is_none_or(|expected| record.outcome.outcome_kind == expected)
+                    && environment_ref.is_none_or(|expected| {
+                        record.outcome.environment_binding.environment_ref == expected
+                    })
+            })
+            .map(|record| ComputeAcceptedOutcomePublicationSource {
+                outcome: record.outcome.clone(),
+                receipt_id: record.receipt_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            lhs.outcome
+                .accepted_at_ms
+                .cmp(&rhs.outcome.accepted_at_ms)
+                .then_with(|| lhs.outcome.outcome_id.cmp(&rhs.outcome.outcome_id))
+        });
+        items
     }
 
     pub fn list_compute_synthetic_data_jobs(
@@ -2923,6 +3784,110 @@ impl KernelState {
         self.validator_challenges.snapshot(challenge_id)
     }
 
+    pub fn get_training_validator_challenge_finalization_receipt_id(
+        &self,
+        challenge_id: &str,
+    ) -> Option<String> {
+        self.training_validator_challenge_receipts
+            .get(challenge_id)
+            .and_then(|record| record.finalization_receipt_id.clone())
+    }
+
+    pub fn list_training_validator_challenge_finalization_sources(
+        &self,
+    ) -> Vec<TrainingValidatorChallengeFinalizationSource> {
+        let mut items = self
+            .training_validator_challenge_receipts
+            .iter()
+            .filter_map(|(challenge_id, record)| {
+                Some(TrainingValidatorChallengeFinalizationSource {
+                    challenge_id: challenge_id.clone(),
+                    finalization_receipt_id: record.finalization_receipt_id.clone()?,
+                    node_pubkey_hex: record.node_pubkey_hex.clone()?,
+                    finalized_at_ms: record.finalized_at_ms?,
+                    status: record.status?,
+                    verdict: record.verdict?,
+                })
+            })
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            lhs.finalized_at_ms
+                .cmp(&rhs.finalized_at_ms)
+                .then_with(|| lhs.challenge_id.cmp(&rhs.challenge_id))
+        });
+        items
+    }
+
+    pub fn get_training_trn_publication(
+        &self,
+        publication_key: &str,
+    ) -> Option<TrainingTrnPublicationPointer> {
+        self.training_trn_publications.get(publication_key).cloned()
+    }
+
+    pub fn get_training_trn_publication_record(
+        &self,
+        publication_key: &str,
+    ) -> Option<TrainingTrnPublicationRecord> {
+        self.training_trn_publication_records
+            .get(publication_key)
+            .cloned()
+    }
+
+    pub fn list_training_trn_publications(&self) -> Vec<TrainingTrnPublicationPointer> {
+        let mut items = self
+            .training_trn_publications
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            lhs.subject_kind
+                .cmp(&rhs.subject_kind)
+                .then_with(|| lhs.subject_id.cmp(&rhs.subject_id))
+                .then_with(|| lhs.published_at_ms.cmp(&rhs.published_at_ms))
+        });
+        items
+    }
+
+    pub fn list_training_trn_publication_records(&self) -> Vec<TrainingTrnPublicationRecord> {
+        let mut items = self
+            .training_trn_publication_records
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| {
+            lhs.subject_kind
+                .cmp(&rhs.subject_kind)
+                .then_with(|| lhs.subject_id.cmp(&rhs.subject_id))
+                .then_with(|| lhs.last_attempt_at_ms.cmp(&rhs.last_attempt_at_ms))
+                .then_with(|| lhs.publication_key.cmp(&rhs.publication_key))
+        });
+        items
+    }
+
+    pub fn upsert_training_trn_publication(
+        &mut self,
+        pointer: TrainingTrnPublicationPointer,
+    ) -> Result<(), String> {
+        self.training_trn_publications
+            .insert(pointer.publication_key.clone(), pointer);
+        self.persist_compute_authority_state()
+    }
+
+    pub fn upsert_training_trn_publication_state(
+        &mut self,
+        pointer: Option<TrainingTrnPublicationPointer>,
+        record: TrainingTrnPublicationRecord,
+    ) -> Result<(), String> {
+        if let Some(pointer) = pointer {
+            self.training_trn_publications
+                .insert(pointer.publication_key.clone(), pointer);
+        }
+        self.training_trn_publication_records
+            .insert(record.publication_key.clone(), record);
+        self.persist_compute_authority_state()
+    }
+
     pub fn list_compute_indices(&self, product_id: Option<&str>) -> Vec<ComputeIndex> {
         let mut items = self
             .compute_indices
@@ -2998,6 +3963,7 @@ impl KernelState {
         self.compute_evaluation_samples =
             persisted.compute_evaluation_samples.into_iter().collect();
         self.compute_training_runs = persisted.compute_training_runs.into_iter().collect();
+        self.admitted_training_nodes = persisted.admitted_training_nodes.into_iter().collect();
         self.compute_adapter_training_windows = persisted
             .compute_adapter_training_windows
             .into_iter()
@@ -3017,6 +3983,15 @@ impl KernelState {
             .collect();
         self.delivery_proofs = persisted.delivery_proofs.into_iter().collect();
         self.validator_challenges = persisted.validator_challenges;
+        self.training_trn_publications = persisted.training_trn_publications.into_iter().collect();
+        self.training_trn_publication_records = persisted
+            .training_trn_publication_records
+            .into_iter()
+            .collect();
+        self.training_validator_challenge_receipts = persisted
+            .training_validator_challenge_receipts
+            .into_iter()
+            .collect();
         self.compute_indices = persisted.compute_indices.into_iter().collect();
         self.snapshots = persisted.snapshots;
         self.next_projection_seq = persisted.next_projection_seq.max(1);
@@ -3059,6 +4034,7 @@ impl KernelState {
                 .into_iter()
                 .collect(),
             compute_training_runs: self.compute_training_runs.clone().into_iter().collect(),
+            admitted_training_nodes: self.admitted_training_nodes.clone().into_iter().collect(),
             compute_adapter_training_windows: self
                 .compute_adapter_training_windows
                 .clone()
@@ -3081,6 +4057,17 @@ impl KernelState {
                 .collect(),
             delivery_proofs: self.delivery_proofs.clone().into_iter().collect(),
             validator_challenges: self.validator_challenges.clone(),
+            training_trn_publications: self.training_trn_publications.clone().into_iter().collect(),
+            training_trn_publication_records: self
+                .training_trn_publication_records
+                .clone()
+                .into_iter()
+                .collect(),
+            training_validator_challenge_receipts: self
+                .training_validator_challenge_receipts
+                .clone()
+                .into_iter()
+                .collect(),
             compute_indices: self.compute_indices.clone().into_iter().collect(),
             snapshots: self.snapshots.clone(),
             next_projection_seq: self.next_projection_seq.max(1),
@@ -5146,6 +6133,25 @@ impl KernelState {
         req.outcome.outcome_id.clone_from(&outcome_id);
         req.outcome.accepted_at_ms =
             normalize_created_at_ms(req.outcome.accepted_at_ms, context.now_unix_ms);
+        let closeout_window_id = req
+            .outcome
+            .metadata
+            .get("window_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        let closeout_status = req
+            .outcome
+            .metadata
+            .get("closeout_status")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if closeout_window_id.is_some() != closeout_status.is_some() {
+            return Err("compute_training_closeout_metadata_incomplete".to_string());
+        }
         match req.outcome.outcome_kind {
             ComputeAcceptedOutcomeKind::EvaluationRun => {
                 let eval_run = self
@@ -5165,7 +6171,24 @@ impl KernelState {
                 let training_run = self
                     .get_compute_training_run(req.outcome.source_run_id.as_str())
                     .ok_or_else(|| "compute_training_run_not_found".to_string())?;
-                if training_run.status != ComputeTrainingRunStatus::Accepted {
+                if let Some(closeout_window_id) = closeout_window_id.as_deref() {
+                    let window = self
+                        .get_compute_adapter_training_window(closeout_window_id)
+                        .ok_or_else(|| "compute_adapter_window_not_found".to_string())?;
+                    if window.training_run_id != training_run.training_run_id {
+                        return Err("compute_training_closeout_window_mismatch".to_string());
+                    }
+                    if !matches!(
+                        window.status,
+                        ComputeAdapterWindowStatus::Sealed
+                            | ComputeAdapterWindowStatus::Scored
+                            | ComputeAdapterWindowStatus::Reconciled
+                    ) {
+                        return Err(
+                            "compute_training_closeout_window_not_closeout_ready".to_string()
+                        );
+                    }
+                } else if training_run.status != ComputeTrainingRunStatus::Accepted {
                     return Err("compute_accepted_outcome_training_not_accepted".to_string());
                 }
                 if let Some(apple_metadata) =
@@ -5296,6 +6319,9 @@ impl KernelState {
             contribution.contributor_set_revision_id =
                 req.window.contributor_set_revision_id.clone();
             contribution.validator_policy_ref = req.window.validator_policy_ref.clone();
+            contribution.work_class = req.window.work_class;
+            contribution.replica_type = req.window.replica_type;
+            contribution.base_checkpoint_ref = req.window.base_checkpoint_ref.clone();
             contribution.adapter_target_id = req.window.adapter_target_id.clone();
             contribution.adapter_family = req.window.adapter_family.clone();
             contribution.base_model_ref = req.window.base_model_ref.clone();
@@ -5326,8 +6352,17 @@ impl KernelState {
                     "window_id": req.window.window_id.clone(),
                     "status": req.window.status,
                     "contribution_count": req.contribution_outcomes.len(),
+                    "work_class": req.window.work_class.label(),
+                    "replica_type": req.window.replica_type.label(),
+                    "round_index": req.window.round_index,
+                    "base_checkpoint_ref": req.window.base_checkpoint_ref.clone(),
+                    "planned_local_step_count": req.window.planned_local_step_count,
+                    "aggregation_rule": req.window.aggregation_rule.clone(),
+                    "aggregation_weight_basis": req.window.aggregation_weight_basis.clone(),
                     "promotion_ready": req.window.promotion_ready,
                     "promotion_disposition": req.window.promotion_disposition,
+                    "accepted_aggregate_id": req.window.accepted_aggregate_id.clone(),
+                    "promoted_checkpoint_ref": req.window.promoted_checkpoint_ref.clone(),
                     "accepted_outcome_id": req.window.accepted_outcome_id.clone(),
                 }),
                 evidence: req.evidence.clone(),
@@ -9030,6 +10065,16 @@ impl KernelState {
                 }
             }
         }
+        self.training_validator_challenge_receipts.insert(
+            challenge_id.clone(),
+            TrainingValidatorChallengeReceiptRecord {
+                finalization_receipt_id: Some(put_result.receipt.receipt_id.clone()),
+                node_pubkey_hex: Some(req.lease.validator_id.clone()),
+                finalized_at_ms: Some(req.result.finalized_at_ms as i64),
+                status: Some(req.result.status),
+                verdict: Some(req.result.verdict),
+            },
+        );
 
         let challenge = self
             .validator_challenges
@@ -9041,6 +10086,131 @@ impl KernelState {
         };
         let receipt_event = self.next_receipt_event(put_result.seq, put_result.receipt.clone());
         let snapshot_event = self.refresh_snapshot_for(req.result.finalized_at_ms as i64)?;
+        Ok(MutationResult {
+            response,
+            receipt_event: Some(receipt_event),
+            snapshot_event: Some(snapshot_event),
+        })
+    }
+
+    pub fn retry_validator_challenge(
+        &mut self,
+        context: &KernelMutationContext,
+        mut req: RetryValidatorChallengeRequest,
+    ) -> Result<MutationResult<RetryValidatorChallengeResponse>, String> {
+        let challenge_id = normalize_required(
+            req.lease.challenge_id.as_str(),
+            "validator_challenge_id_missing",
+        )?;
+        req.lease.challenge_id.clone_from(&challenge_id);
+        req.lease.validator_id =
+            normalize_required(req.lease.validator_id.as_str(), "validator_id_missing")?;
+        req.detail = normalize_required(req.detail.as_str(), "validator_challenge_detail_missing")?;
+        if req.finalized_at_ms == 0 {
+            req.finalized_at_ms = context.now_unix_ms;
+        }
+
+        let Some(existing_snapshot) = self.validator_challenges.snapshot(challenge_id.as_str())
+        else {
+            return Err("validator_challenge_not_found".to_string());
+        };
+        if existing_snapshot.active_lease.as_ref() != Some(&req.lease) {
+            return Err("validator_challenge_lease_invalid".to_string());
+        }
+        let delivery_proof_id = existing_snapshot.request.context.delivery_proof_id.clone();
+
+        req.policy = normalized_policy(req.policy, context);
+        let request_hash = request_hash(&req)?;
+        let mut evidence = req.evidence.clone();
+        if let Some(delivery_proof_id) = delivery_proof_id.as_ref()
+            && let Some(record) = self.delivery_proofs.get(delivery_proof_id.as_str())
+        {
+            push_receipt_evidence(
+                &mut evidence,
+                self.receipt_store
+                    .get_receipt(record.receipt_id.as_str())
+                    .as_ref(),
+            );
+        }
+        let receipt = build_receipt(
+            context,
+            &req.idempotency_key,
+            KernelReceiptSpec {
+                action: "kernel.compute.validator_challenge.retry".to_string(),
+                created_at_ms: req.finalized_at_ms as i64,
+                trace: req.trace.clone(),
+                policy: req.policy.clone(),
+                inputs_payload: json!({
+                    "challenge_id": challenge_id.clone(),
+                    "lease": req.lease.clone(),
+                    "detail": req.detail.clone(),
+                    "finalized_at_ms": req.finalized_at_ms,
+                }),
+                outputs_payload: json!({
+                    "challenge_id": challenge_id.clone(),
+                    "delivery_proof_id": delivery_proof_id.clone(),
+                    "status": ValidatorChallengeStatus::Retrying,
+                }),
+                evidence,
+                hints: req.hints.clone(),
+            },
+        )?;
+        let put_result = self.receipt_store.put_receipt(
+            "kernel.compute.validator_challenge.retry",
+            context.caller_id.as_str(),
+            req.idempotency_key.as_str(),
+            request_hash.as_str(),
+            receipt,
+        );
+        let receipt = match put_result {
+            Ok(ref result) => result.receipt.clone(),
+            Err(ref error) => return Err(receipt_store_reason(error).to_string()),
+        };
+        let put_result = put_result.map_err(|error| receipt_store_reason(&error).to_string())?;
+        if put_result.replayed {
+            let challenge = self
+                .validator_challenges
+                .snapshot(challenge_id.as_str())
+                .ok_or_else(|| "validator_challenge_not_found".to_string())?;
+            return Ok(MutationResult {
+                response: RetryValidatorChallengeResponse { challenge, receipt },
+                receipt_event: None,
+                snapshot_event: None,
+            });
+        }
+
+        let retry_result = self
+            .validator_challenges
+            .retry_lease(&req.lease, req.finalized_at_ms, req.detail.clone())
+            .map_err(|error| validator_service_reason(&error).to_string())?;
+        if matches!(retry_result.status, ValidatorChallengeStatus::TimedOut)
+            && let Some(delivery_proof_id) = delivery_proof_id.as_ref()
+        {
+            let delivery_proof = self
+                .delivery_proofs
+                .get(delivery_proof_id.as_str())
+                .map(|record| record.delivery_proof.clone());
+            if let Some(delivery_proof) = delivery_proof {
+                self.trigger_compute_coverage_bindings(
+                    &delivery_proof,
+                    compute_challenge_trigger_reason(retry_result.status),
+                    req.finalized_at_ms as i64,
+                    Some(challenge_id.as_str()),
+                    Some(retry_result.challenge_result_ref.as_str()),
+                )?;
+            }
+        }
+
+        let challenge = self
+            .validator_challenges
+            .snapshot(challenge_id.as_str())
+            .ok_or_else(|| "validator_challenge_not_found".to_string())?;
+        let response = RetryValidatorChallengeResponse {
+            challenge,
+            receipt: put_result.receipt.clone(),
+        };
+        let receipt_event = self.next_receipt_event(put_result.seq, put_result.receipt.clone());
+        let snapshot_event = self.refresh_snapshot_for(req.finalized_at_ms as i64)?;
         Ok(MutationResult {
             response,
             receipt_event: Some(receipt_event),
@@ -13389,11 +14559,214 @@ fn normalize_required(value: &str, reason: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
+fn normalize_string_vec(values: Vec<String>) -> Vec<String> {
+    let mut normalized = values
+        .into_iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
+}
+
+fn normalize_training_node_role_claims(
+    values: Vec<TrainingNodeRoleClaim>,
+) -> Vec<TrainingNodeRoleClaim> {
+    let mut seen = BTreeSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.label().to_string()))
+        .collect()
+}
+
 fn normalize_created_at_ms(value: i64, now_unix_ms: u64) -> i64 {
     if value <= 0 {
         now_unix_ms as i64
     } else {
         value
+    }
+}
+
+fn training_node_registry_key(node_pubkey_hex: &str, build_digest: &str) -> String {
+    format!("{node_pubkey_hex}:{build_digest}")
+}
+
+fn training_node_admission_id(node_pubkey_hex: &str, build_digest: &str) -> String {
+    format!(
+        "trainnode.{}",
+        sha256_prefixed_text(format!("{node_pubkey_hex}:{build_digest}").as_str())
+    )
+}
+
+fn training_node_matches_network(
+    node: &AdmittedTrainingNodeView,
+    network_id: Option<&str>,
+) -> bool {
+    network_id.is_none_or(|expected| {
+        node.allowed_networks.is_empty()
+            || node.allowed_networks.iter().any(|value| value == expected)
+    })
+}
+
+fn training_node_has_hard_gate_label(labels: &[String]) -> bool {
+    pylon_training_hard_gate_reason(labels).is_some()
+}
+
+fn training_node_available_disk_gb(node: &AdmittedTrainingNode) -> Option<u64> {
+    let telemetry = node.host_telemetry.as_ref()?;
+    let disk = telemetry
+        .disks
+        .iter()
+        .filter(|disk| disk.pylon_home_disk)
+        .max_by_key(|disk| disk.available_space_bytes)
+        .or_else(|| {
+            telemetry
+                .disks
+                .iter()
+                .max_by_key(|disk| disk.available_space_bytes)
+        })?;
+    Some(disk.available_space_bytes / (1024 * 1024 * 1024))
+}
+
+fn training_node_is_online(node: &AdmittedTrainingNode, now_unix_ms: i64) -> bool {
+    let Some(last_heartbeat_at_ms) = node.last_heartbeat_at_ms else {
+        return false;
+    };
+    if now_unix_ms.saturating_sub(last_heartbeat_at_ms) > TRAINING_NODE_HEARTBEAT_STALE_AFTER_MS {
+        return false;
+    }
+    !matches!(
+        node.last_process_state,
+        Some(TrainingNodeProcessState::Stopped | TrainingNodeProcessState::Failed)
+    ) && !matches!(
+        node.last_desired_state,
+        Some(TrainingNodeDesiredState::Stopped)
+    )
+}
+
+fn training_node_is_eligible(node: &AdmittedTrainingNode) -> bool {
+    node.contributor_availability.product_backend_ready()
+        && !training_node_has_hard_gate_label(&node.active_reputation_labels)
+}
+
+fn admitted_training_node_view(
+    node: &AdmittedTrainingNode,
+    now_unix_ms: i64,
+) -> AdmittedTrainingNodeView {
+    AdmittedTrainingNodeView {
+        admission_id: node.admission_id.clone(),
+        node_pubkey_hex: node.node_pubkey_hex.clone(),
+        release_id: node.release_id.clone(),
+        node_label: node.node_label.clone(),
+        role_claims: node.role_claims.clone(),
+        allowed_networks: node.allowed_networks.clone(),
+        build_version: node.build_version.clone(),
+        build_digest: node.build_digest.clone(),
+        contributor_availability: node.contributor_availability.clone(),
+        capability_tier: node.capability_tier.clone(),
+        capability_envelope_v2: node.capability_envelope_v2.clone(),
+        available_memory_gb: node
+            .contributor_availability
+            .available_memory_gb
+            .or_else(|| {
+                node.host_telemetry.as_ref().and_then(|telemetry| {
+                    telemetry
+                        .memory
+                        .as_ref()
+                        .map(|memory| (memory.available_bytes / (1024 * 1024 * 1024)) as u32)
+                })
+            }),
+        available_disk_gb: training_node_available_disk_gb(node),
+        active_reputation_labels: node.active_reputation_labels.clone(),
+        settlement_destination: node.settlement_destination.clone(),
+        admitted_at_ms: node.admitted_at_ms,
+        updated_at_ms: node.updated_at_ms,
+        last_heartbeat_at_ms: node.last_heartbeat_at_ms,
+        last_training_run_id: node.last_training_run_id.clone(),
+        last_window_id: node.last_window_id.clone(),
+        last_assignment_id: node.last_assignment_id.clone(),
+        last_lease_id: node.last_lease_id.clone(),
+        last_desired_state: node.last_desired_state,
+        last_process_state: node.last_process_state,
+        last_exit_code: node.last_exit_code,
+        last_successful_run_id: node.last_successful_run_id.clone(),
+        last_successful_window_id: node.last_successful_window_id.clone(),
+        online: training_node_is_online(node, now_unix_ms),
+        eligible: training_node_is_eligible(node),
+    }
+}
+
+fn admitted_training_node_from_request(
+    existing: Option<&AdmittedTrainingNode>,
+    req: &RecordTrainingNodeAdmissionRequest,
+    admission_id: String,
+    build_digest: String,
+) -> AdmittedTrainingNode {
+    AdmittedTrainingNode {
+        admission_id,
+        node_pubkey_hex: req.node_pubkey_hex.clone(),
+        release_id: req.release_id.clone(),
+        node_label: req.node_label.clone(),
+        role_claims: req.role_claims.clone(),
+        allowed_networks: req.allowed_networks.clone(),
+        build_version: req.build_version.clone(),
+        build_digest,
+        contributor_availability: req.contributor_availability.clone(),
+        capability_tier: req.capability_tier.clone(),
+        capability_envelope_v2: req.capability_envelope_v2.clone(),
+        host_telemetry: req.host_telemetry.clone(),
+        active_reputation_labels: req.active_reputation_labels.clone(),
+        settlement_destination: req.settlement_destination.clone(),
+        admitted_at_ms: existing
+            .map(|node| node.admitted_at_ms)
+            .unwrap_or(req.requested_at_ms),
+        updated_at_ms: req.requested_at_ms,
+        last_heartbeat_at_ms: existing.and_then(|node| node.last_heartbeat_at_ms),
+        last_training_run_id: existing.and_then(|node| node.last_training_run_id.clone()),
+        last_window_id: existing.and_then(|node| node.last_window_id.clone()),
+        last_assignment_id: existing.and_then(|node| node.last_assignment_id.clone()),
+        last_lease_id: existing.and_then(|node| node.last_lease_id.clone()),
+        last_desired_state: existing.and_then(|node| node.last_desired_state),
+        last_process_state: existing.and_then(|node| node.last_process_state),
+        last_exit_code: existing.and_then(|node| node.last_exit_code),
+        last_successful_run_id: existing.and_then(|node| node.last_successful_run_id.clone()),
+        last_successful_window_id: existing.and_then(|node| node.last_successful_window_id.clone()),
+    }
+}
+
+fn training_node_lease_state_for(
+    desired_state: TrainingNodeDesiredState,
+    process_state: TrainingNodeProcessState,
+) -> String {
+    if matches!(desired_state, TrainingNodeDesiredState::Draining)
+        || matches!(process_state, TrainingNodeProcessState::Draining)
+    {
+        "draining".to_string()
+    } else if matches!(desired_state, TrainingNodeDesiredState::Stopped)
+        || matches!(
+            process_state,
+            TrainingNodeProcessState::Stopped | TrainingNodeProcessState::Failed
+        )
+    {
+        "stopped".to_string()
+    } else {
+        "active".to_string()
+    }
+}
+
+fn training_node_window_state_for(
+    process_state: TrainingNodeProcessState,
+    last_exit_code: Option<i32>,
+) -> String {
+    match process_state {
+        TrainingNodeProcessState::Launching | TrainingNodeProcessState::Running => {
+            "active".to_string()
+        }
+        TrainingNodeProcessState::Draining => "sealing".to_string(),
+        TrainingNodeProcessState::Stopped if last_exit_code == Some(0) => "completed".to_string(),
+        TrainingNodeProcessState::Stopped => "stopped".to_string(),
+        TrainingNodeProcessState::Failed => "failed".to_string(),
     }
 }
 
@@ -13972,9 +15345,10 @@ mod tests {
     use super::{
         ComputeBondDraw, ComputeProductRecord, ComputeRiskTrigger,
         FinalizeValidatorChallengeRequest, KernelMutationContext, KernelState,
-        LeaseValidatorChallengeRequest, ScheduleValidatorChallengeRequest, compute_index_family_id,
-        compute_index_methodology_id, compute_index_minimum_proof_posture, decode_metadata_struct,
-        floor_to_minute_utc, money_amount_value,
+        LeaseValidatorChallengeRequest, RetryValidatorChallengeRequest,
+        ScheduleValidatorChallengeRequest, compute_index_family_id, compute_index_methodology_id,
+        compute_index_minimum_proof_posture, decode_metadata_struct, floor_to_minute_utc,
+        money_amount_value,
     };
     use openagents_kernel_core::authority::{
         AcceptComputeOutcomeRequest, AppendComputeEvaluationSamplesRequest,
@@ -14020,10 +15394,11 @@ mod tests {
         ComputeSettlementFailureReason, ComputeSettlementMode, ComputeSyntheticDataJob,
         ComputeSyntheticDataJobStatus, ComputeSyntheticDataSample,
         ComputeSyntheticDataSampleStatus, ComputeTopologyKind, ComputeTrainingPolicy,
-        ComputeTrainingRun, ComputeTrainingRunStatus, ComputeTrainingSummary,
-        ComputeValidatorPolicy, ComputeValidatorRequirements, DeliveryProof, DeliveryProofStatus,
-        DeliveryRejectionReason, DeliveryTopologyEvidence, DeliveryVerificationEvidence,
-        GptOssRuntimeCapability, StructuredCapacityInstrument, StructuredCapacityInstrumentKind,
+        ComputeTrainingReplicaType, ComputeTrainingRun, ComputeTrainingRunStatus,
+        ComputeTrainingSummary, ComputeTrainingWorkClass, ComputeValidatorPolicy,
+        ComputeValidatorRequirements, DeliveryProof, DeliveryProofStatus, DeliveryRejectionReason,
+        DeliveryTopologyEvidence, DeliveryVerificationEvidence, GptOssRuntimeCapability,
+        StructuredCapacityInstrument, StructuredCapacityInstrumentKind,
         StructuredCapacityInstrumentStatus, StructuredCapacityLeg, StructuredCapacityLegRole,
     };
     use openagents_kernel_core::liquidity::{ReservePartition, ReservePartitionStatus};
@@ -14542,6 +15917,8 @@ mod tests {
                     recovery_posture: Some("warm-resume".to_string()),
                 },
                 validator_policy_ref: "policy://validator/training".to_string(),
+                work_class: ComputeTrainingWorkClass::AdapterTraining,
+                replica_type: ComputeTrainingReplicaType::SingleNode,
                 benchmark_package_refs: vec!["benchmark://mmlu/reference".to_string()],
                 product_id: Some("psionic.training.gradient.elastic".to_string()),
                 capacity_lot_id: Some("lot.training.alpha".to_string()),
@@ -14665,6 +16042,65 @@ mod tests {
         }
     }
 
+    fn accept_training_window_closeout_request(
+        accepted_at_ms: i64,
+        closeout_status: &str,
+        payout_eligible: bool,
+    ) -> AcceptComputeOutcomeRequest {
+        AcceptComputeOutcomeRequest {
+            idempotency_key: "idemp.compute.outcome.accept.training_window.alpha".to_string(),
+            trace: TraceContext::default(),
+            policy: PolicyContext::default(),
+            outcome: ComputeAcceptedOutcome {
+                outcome_id: "accepted.training_window.alpha".to_string(),
+                outcome_kind: ComputeAcceptedOutcomeKind::TrainingRun,
+                source_run_id: "train.math.basic.alpha".to_string(),
+                environment_binding: ComputeEnvironmentBinding {
+                    environment_ref: "env.openagents.math.basic".to_string(),
+                    environment_version: Some("2026.03.13".to_string()),
+                    dataset_ref: Some("dataset://math/basic".to_string()),
+                    rubric_ref: Some("rubric://math/basic".to_string()),
+                    evaluator_policy_ref: Some("policy://eval/math/basic".to_string()),
+                },
+                checkpoint_binding: None,
+                validator_policy_ref: None,
+                benchmark_package_refs: Vec::new(),
+                accepted_at_ms,
+                evaluation_summary: None,
+                training_summary: Some(ComputeTrainingSummary {
+                    completed_step_count: Some(32),
+                    processed_token_count: Some(64_000),
+                    average_loss: Some(0.42),
+                    best_eval_score_bps: Some(9_400),
+                    accepted_checkpoint_ref: None,
+                    aggregate_metrics: vec![ComputeEvaluationMetric {
+                        metric_id: "held_out_average_score_bps".to_string(),
+                        metric_value: 9_400.0,
+                        unit: Some("bps".to_string()),
+                        metadata: json!({"window_id": "adapter.window.alpha"}),
+                    }],
+                    artifacts: vec![ComputeEvaluationArtifact {
+                        artifact_kind: "aggregated_delta".to_string(),
+                        artifact_ref:
+                            "artifact://training/windows/adapter.window.alpha/aggregated_delta"
+                                .to_string(),
+                        digest: Some("sha256:adapter-aggregate-alpha".to_string()),
+                        metadata: json!({"window_id": "adapter.window.alpha"}),
+                    }],
+                }),
+                metadata: json!({
+                    "accepted_by": "kernel",
+                    "window_id": "adapter.window.alpha",
+                    "closeout_scope": "sealed_window",
+                    "closeout_status": closeout_status,
+                    "payout_eligible": payout_eligible,
+                }),
+            },
+            evidence: Vec::new(),
+            hints: ReceiptHints::default(),
+        }
+    }
+
     fn adapter_policy_revision(
         revision_id: &str,
         produced_at_ms: i64,
@@ -14711,6 +16147,14 @@ mod tests {
                 stage_id: "sft".to_string(),
                 contributor_set_revision_id: "contributors.rev.1".to_string(),
                 validator_policy_ref: "policy://validator/training".to_string(),
+                work_class: ComputeTrainingWorkClass::AdapterTraining,
+                replica_type: ComputeTrainingReplicaType::SingleNode,
+                round_index: Some(7),
+                base_checkpoint_ref: "checkpoint://decoder/train.math.basic.alpha/promotion"
+                    .to_string(),
+                planned_local_step_count: Some(64),
+                aggregation_rule: Some("weighted_avg".to_string()),
+                aggregation_weight_basis: Some("tokens".to_string()),
                 adapter_target_id: "adapter.target.math-basic".to_string(),
                 adapter_family: "openagents.adapter.reference".to_string(),
                 base_model_ref: "model://llama3.2".to_string(),
@@ -14734,8 +16178,12 @@ mod tests {
                 promotion_disposition: Some(ComputeAdapterPromotionDisposition::Promoted),
                 hold_reason_codes: Vec::new(),
                 aggregated_delta_digest: Some("sha256:adapter-aggregate-alpha".to_string()),
+                accepted_aggregate_id: Some("aggregate.adapter.alpha".to_string()),
                 output_policy_revision: Some(output_policy_revision),
                 output_checkpoint_pointer: Some(output_checkpoint_pointer),
+                promoted_checkpoint_ref: Some(
+                    "checkpoint://decoder/train.math.basic.alpha/promotion".to_string(),
+                ),
                 accepted_outcome_id: None,
                 recorded_at_ms,
                 metadata: json!({"validator_window_id": "validator.window.alpha"}),
@@ -14751,6 +16199,10 @@ mod tests {
                     contributor_node_id: "node.alpha".to_string(),
                     worker_id: "worker.alpha".to_string(),
                     validator_policy_ref: "policy://validator/training".to_string(),
+                    work_class: ComputeTrainingWorkClass::AdapterTraining,
+                    replica_type: ComputeTrainingReplicaType::SingleNode,
+                    base_checkpoint_ref: "checkpoint://decoder/train.math.basic.alpha/promotion"
+                        .to_string(),
                     adapter_target_id: "adapter.target.math-basic".to_string(),
                     adapter_family: "openagents.adapter.reference".to_string(),
                     base_model_ref: "model://llama3.2".to_string(),
@@ -14776,6 +16228,11 @@ mod tests {
                     validator_receipt_digest: "sha256:validator-alpha".to_string(),
                     aggregation_eligibility: ComputeAdapterAggregationEligibility::Eligible,
                     accepted_for_aggregation: true,
+                    local_step_count: Some(64),
+                    consumed_token_count: Some(131_072),
+                    consumed_example_count: Some(256),
+                    aggregation_weight_basis: Some("tokens".to_string()),
+                    aggregation_weight_value: Some(131_072),
                     aggregation_weight_bps: Some(10_000),
                     promotion_receipt_digest: Some("sha256:promotion-alpha".to_string()),
                     recorded_at_ms,
@@ -14791,6 +16248,10 @@ mod tests {
                     contributor_node_id: "node.beta".to_string(),
                     worker_id: "worker.beta".to_string(),
                     validator_policy_ref: "policy://validator/training".to_string(),
+                    work_class: ComputeTrainingWorkClass::AdapterTraining,
+                    replica_type: ComputeTrainingReplicaType::SingleNode,
+                    base_checkpoint_ref: "checkpoint://decoder/train.math.basic.alpha/promotion"
+                        .to_string(),
                     adapter_target_id: "adapter.target.math-basic".to_string(),
                     adapter_family: "openagents.adapter.reference".to_string(),
                     base_model_ref: "model://llama3.2".to_string(),
@@ -14818,6 +16279,11 @@ mod tests {
                     validator_receipt_digest: "sha256:validator-beta".to_string(),
                     aggregation_eligibility: ComputeAdapterAggregationEligibility::Ineligible,
                     accepted_for_aggregation: false,
+                    local_step_count: Some(64),
+                    consumed_token_count: Some(131_072),
+                    consumed_example_count: Some(256),
+                    aggregation_weight_basis: None,
+                    aggregation_weight_value: None,
                     aggregation_weight_bps: None,
                     promotion_receipt_digest: None,
                     recorded_at_ms,
@@ -16345,6 +17811,92 @@ mod tests {
                 )
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn accepts_training_window_closeout_for_running_training_run() {
+        let created_at_ms = 1_762_000_324_500u64;
+        let mut kernel = KernelState::default();
+
+        kernel
+            .register_compute_environment_package(
+                &fixture_context(created_at_ms),
+                environment_package_request(
+                    "env.openagents.math.basic",
+                    "2026.03.13",
+                    created_at_ms as i64,
+                ),
+            )
+            .expect("register environment package");
+        kernel
+            .register_compute_checkpoint_family_policy(
+                &fixture_context(created_at_ms + 100),
+                checkpoint_family_policy_request(created_at_ms as i64 + 100),
+            )
+            .expect("register checkpoint policy");
+        kernel
+            .register_compute_validator_policy(
+                &fixture_context(created_at_ms + 200),
+                validator_policy_request(created_at_ms as i64 + 200),
+            )
+            .expect("register validator policy");
+        kernel
+            .register_compute_benchmark_package(
+                &fixture_context(created_at_ms + 300),
+                benchmark_package_request(created_at_ms as i64 + 300),
+            )
+            .expect("register benchmark package");
+        kernel
+            .register_compute_training_policy(
+                &fixture_context(created_at_ms + 400),
+                training_policy_request(created_at_ms as i64 + 400),
+            )
+            .expect("register training policy");
+        kernel
+            .create_compute_training_run(
+                &fixture_context(created_at_ms + 500),
+                training_run_request(created_at_ms as i64 + 500),
+            )
+            .expect("create training run");
+        kernel
+            .record_compute_adapter_window(
+                &fixture_context(created_at_ms + 600),
+                adapter_window_request(created_at_ms as i64 + 600),
+            )
+            .expect("record adapter window");
+
+        let accepted = kernel
+            .accept_compute_outcome(
+                &fixture_context(created_at_ms + 700),
+                accept_training_window_closeout_request(
+                    created_at_ms as i64 + 700,
+                    "rewarded",
+                    true,
+                ),
+            )
+            .expect("accept training window closeout");
+        assert_eq!(
+            accepted.response.outcome.outcome_kind,
+            ComputeAcceptedOutcomeKind::TrainingRun
+        );
+        assert_eq!(
+            accepted
+                .response
+                .outcome
+                .metadata
+                .get("closeout_status")
+                .and_then(Value::as_str),
+            Some("rewarded")
+        );
+        assert_eq!(
+            accepted
+                .response
+                .outcome
+                .metadata
+                .get("window_id")
+                .and_then(Value::as_str),
+            Some("adapter.window.alpha")
         );
     }
 
@@ -18715,6 +20267,70 @@ mod tests {
         assert_eq!(
             replayed_finalize.response.challenge.status,
             ValidatorChallengeStatus::Verified
+        );
+    }
+
+    #[test]
+    fn validator_challenge_retry_requeues_and_releases_next_attempt() {
+        let created_at_ms = 1_762_000_347_500u64;
+        let mut kernel = KernelState::default();
+
+        kernel
+            .schedule_validator_challenge(
+                &fixture_context(created_at_ms),
+                validator_challenge_request("challenge.compute.retry", None, created_at_ms),
+            )
+            .expect("schedule");
+
+        let first_lease = kernel
+            .lease_validator_challenge(
+                &fixture_context(created_at_ms + 1_000),
+                validator_lease_request(
+                    "challenge.compute.retry",
+                    "validator.retry",
+                    created_at_ms + 1_000,
+                    "idemp.compute.validator.lease.retry.1",
+                ),
+            )
+            .expect("first lease");
+        assert_eq!(first_lease.response.lease.attempt, 1);
+
+        let retried = kernel
+            .retry_validator_challenge(
+                &fixture_context(created_at_ms + 1_100),
+                RetryValidatorChallengeRequest {
+                    idempotency_key: "idemp.compute.validator.retry.1".to_string(),
+                    trace: TraceContext::default(),
+                    policy: PolicyContext::default(),
+                    lease: first_lease.response.lease.clone(),
+                    finalized_at_ms: created_at_ms + 1_100,
+                    detail: "temporary validator transport failure".to_string(),
+                    evidence: Vec::new(),
+                    hints: ReceiptHints::default(),
+                },
+            )
+            .expect("retry");
+        assert_eq!(
+            retried.response.challenge.status,
+            ValidatorChallengeStatus::Retrying
+        );
+        assert!(retried.response.challenge.active_lease.is_none());
+
+        let second_lease = kernel
+            .lease_validator_challenge(
+                &fixture_context(created_at_ms + 1_200),
+                validator_lease_request(
+                    "challenge.compute.retry",
+                    "validator.retry",
+                    created_at_ms + 1_200,
+                    "idemp.compute.validator.lease.retry.2",
+                ),
+            )
+            .expect("second lease");
+        assert_eq!(second_lease.response.lease.attempt, 2);
+        assert_eq!(
+            second_lease.response.challenge.status,
+            ValidatorChallengeStatus::Leased
         );
     }
 

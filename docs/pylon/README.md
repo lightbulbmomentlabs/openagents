@@ -2,6 +2,32 @@
 
 `Pylon` is the standalone provider program for the OpenAgents Compute Market.
 
+Current distributed-training planning lives here too:
+
+- `docs/pylon/2026-04-09-pylon-distributed-training-reference-audit.md`
+- `docs/pylon/distributed-training-mvp-roadmap.md`
+- `docs/pylon/distributed-training-phase-tracker.md`
+- `docs/pylon/distributed-training-launch-status.md`
+- `docs/pylon/PYLON_DISTRIBUTED_TRAINING_REHEARSAL_MATRIX.md`
+- `docs/pylon/PYLON_DISTRIBUTED_TRAINING_APPLE_REHEARSAL_MATRIX.md`
+- `docs/pylon/distributed-training-non-blockers.md`
+
+The matching prior-art and terminology review lives outside `docs/pylon/`:
+
+- `docs/training/distributed-llm-training-runs-diloco-distro-demo-sparseloco-audit.md`
+
+Use those docs for different questions:
+
+- roadmap and phase tracker: what the admitted-node MVP implementation closed
+- launch status: what is still needed for the stronger public launch story to
+  be literally true
+- training audit: how DiLoCo, DisTrO/DeMo, SparseLoCo, Prime, Templar, and
+  other public systems actually relate
+
+The frozen Phase 0 machine-readable contract for that roadmap now lives in:
+
+- `crates/openagents-kernel-core/src/pylon_training.rs`
+
 The default local repo entrypoint is the small terminal shell:
 
 ```bash
@@ -153,6 +179,213 @@ Current planned-but-not-live surfaces:
 - broad wallet-shell UX
 - sandbox execution as a generally released family
 
+Training remains a planned surface rather than a launched product family, but
+`pylon status --json` now projects a bounded `adapter_training_contributor`
+capability envelope when the machine can actually prove the local prerequisites:
+
+- a sibling `Psionic` checkout with the machine `psionic-train` surface present
+- NVIDIA CUDA telemetry visible to the node
+- one admitted H100-class CUDA worker posture
+- local disk and non-loopback network posture suitable for checkpoint and
+  coordinator participation
+
+That projection is intentionally narrow. `Pylon` does not yet launch or
+advertise broader mixed-backend or permissionless training claims.
+
+The retained training shell now also includes the first internal
+`psionic-train` supervision core in `apps/pylon/src/lib.rs`. It can launch one
+manifest-bound child process, retain per-attempt stdout and stderr logs, watch
+heartbeat files under the assigned run root, refuse conflicting assignments,
+persist exit state and machine-readable failure receipts, and rotate preserved
+attempt history across drain and restart. That foundation is intentionally
+internal for now, but it is no longer isolated from the live coordinator path.
+When `pylon serve` is online, the retained training state now also drives an
+automatic `Nexus` intake pass: `Pylon` admits the node, claims one compatible
+lease, acknowledges the assignment, and persists the leased window state into
+`training/state/runtime-state.json` without requiring an operator-crafted
+command. `Pylon` now also materializes the accepted lease into the exact
+`psionic.train.invocation_manifest.v1` family that `psionic-train` already
+validates and acknowledges Nexus with that retained machine-manifest path. The
+runtime projection freezes the admitted lane, role, operation, work class,
+coordination envelope, and current Psionic release/build/environment identity
+derived from the sibling checkout, including dirty-tree override posture when
+the local Psionic checkout is not clean. Assignment intake now also resolves
+the canonical run manifest and latest checkpoint artifacts through the Nexus
+training artifact resolver, requests signed read URLs, verifies the returned
+payload digests and sizes when authority metadata is available, and stages the
+materialized bytes into the retained run root plus the local resolved-artifact
+cache under `training/runs/<run_id>/artifacts/resolved/` and
+`training/download-cache/resolved/`. When `pylon serve` stays online after that
+lease is acknowledged, the same retained state now also drives the existing
+`psionic-train` supervisor path automatically: `Pylon` launches the retained
+manifest, captures stdout and stderr into attempt-scoped logs under
+`training/runs/<run_id>/supervisor/`, updates retained process state and exit
+status, and preserves the runtime status packets already emitted by
+`psionic-train`. Once that retained runtime reaches a terminal state, `Pylon`
+now runs the existing training artifact courier and TRN publication sweep
+automatically, then posts the matching Nexus coordination notices for window
+progress, checkpoint publication, and failures or refusals. Those receipt
+attempts persist retry state in the retained training runtime journal so later
+`pylon serve` loops can finish the handoff without an operator moving files by
+hand. `dashboard/current_dashboard.json` and `alerts/active_alerts.json` still
+remain local operator surfaces today; the automated Nexus intake path currently
+tracks the kernel-owned artifact families already modeled in the retained
+training layout.
+
+`Pylon` now also has the first training-coordination HTTP client in
+`apps/pylon/src/lib.rs`. It wraps the existing kernel training-policy and
+training-run lookup routes and defines one idempotent node-side coordination
+lane for node admission, run lease, heartbeat, assignment ack, drain notice,
+failure notice, window progress, and checkpoint publication. The client keeps
+the `Nexus` bearer token env-only through
+`OPENAGENTS_PYLON_TRAINING_NEXUS_BEARER_TOKEN`; it does not persist that secret
+into `PylonConfig` or the retained runtime-state store. `pylon serve` now calls
+that same client automatically on a short interval whenever the provider is in
+`online` mode, so training assignment discovery and acceptance use the existing
+retained Pylon process instead of a second launcher or a manual operator loop.
+
+`Pylon` now also carries the first retained training artifact courier and
+checkpoint-serving foundation. `apps/pylon/src/lib.rs` can now:
+
+- upload checkpoint, contribution-proof, and score bundles to the frozen
+  `gs://` layout with retry and digest verification
+- resolve retained training run bootstrap artifacts through Nexus-issued signed
+  read URLs and materialize `run_manifest.json`, `latest_pointer.json`, and the
+  current `checkpoint_manifest.json` into the run-scoped local filesystem shape
+- download and verify those same bundles into the retained download cache under
+  `training/download-cache/`
+- expose a bounded local checkpoint HTTP path for recovery clients
+- inspect local manifests and artifact state through
+  `pylon training artifacts inspect`
+- garbage-collect stale downloaded artifacts through
+  `pylon training artifacts gc`
+
+The transport credentials still stay env-only at runtime. `Pylon` resolves the
+persisted credential-source name through Application Default Credentials and
+can mint GCS bearer tokens from either `GOOGLE_APPLICATION_CREDENTIALS` or
+instance metadata without writing raw secrets into retained state.
+
+`Pylon` now also has the first retained training TRN publication lane. The
+same `apps/pylon/src/lib.rs` surface can now:
+
+- publish `kind:39501` training node records from retained run-manifest state
+- publish `kind:39511` assignment-accepted and artifact-uploaded receipts
+- publish `kind:39520` staged artifact locators after the retained GCS courier
+  uploads and re-verifies the underlying objects
+- persist event ids and `a` references into the retained training runtime
+  state for later operator/admin projection through
+  `pylon training publish [--manifest <path>]`
+
+The retained training node record now also carries one scheduler-readable
+training capability envelope derived from local host telemetry and retained
+training runtime state. That envelope is published both in the TRN
+`kind:39501` content and in explicit capability tags so downstream schedulers
+and public stats consumers can read:
+
+- schema version (`provider.training_capability_envelope.v2`)
+- capability tier (`tier0_presence` through `tier4_authority`)
+- backend families and accelerator inventory
+- memory floor and currently available memory
+- throughput band
+- lease reliability class
+- replay capability
+- artifact upload latency class
+- benchmark-lane availability and runtime-surface detection
+- eligible work classes such as `validation_replay`, `evaluation`,
+  `adapter_training`, `grouped_replica_stage_execution`, and
+  `full_island_local_update_training`
+- eligible replica types such as `single_node`, `grouped_replica`, and
+  `island`
+
+For the current public launch explanation of weaker-device work classes and how
+accepted-work payout differs from uptime or presence alone, use
+`docs/pylon/WEAK_DEVICE_WORK_CLASSES_FAQ.md`.
+
+This is still the node-side claim lane, not the final authoritative `Nexus`
+publication lane. The current locator status is intentionally `staged`, and
+`Nexus` closeout state still remains the authoritative settlement boundary.
+The authoritative `Nexus` lane now also publishes typed `kind:39520` training
+artifact locators for accepted local updates, reconciled aggregate artifacts,
+and promoted checkpoints so relay readers can distinguish round contributions
+from aggregate and checkpoint lineage without moving heavy bytes over Nostr.
+
+`Pylon` also now has a retained authority-sync lane for training closeout and
+reputation state. `pylon training sync [--json]` will:
+
+- fetch adapter contribution outcomes from `Nexus` for retained manifests
+- fetch accepted training outcomes and cache them as accepted sealed-window
+  closeout state
+- query retained training relays for relevant `kind:1985` `NIP-32` labels that
+  target the local node or previously published training events
+- persist those caches into the retained training runtime-state store
+- fail closed on automatic training readvertisement when a cached hard-gate
+  training label such as `trn/build=revoked` still applies
+
+Those retained caches are now projected through the operator surface instead of
+staying buried in `state/runtime-state.json` only:
+
+- `pylon training status [--json]`
+  - renders the retained training operator report directly: current run,
+    active window, current runtime state, any retained leased assignment that
+    has been accepted but not launched yet, last checkpoint pointer, validator
+    queue, retained capability tier, retained TRN publication pointers, recent
+    closeouts, and recent refusals or failures
+- `pylon status`
+  - now appends a concise training summary to the top-level provider status,
+    including the training headline (`active`, `leased`, `blocked`, `ready`,
+    or `inactive`), the retained capability tier, the active or leased
+    run/window when present, the last checkpoint ref, validator-queue depth,
+    and the most recent retained training issue
+- `pylon doctor`
+  - now includes a dedicated `training` block covering runtime-surface
+    discovery, contributor readiness, retained capability tier and capability
+    envelope,
+    checkpoint-serve URL, retained role claims, retention limits, blocked
+    reputation labels, and recent retained issues
+
+The shared admin port now also exposes training-aware HTTP routes alongside the
+existing provider status routes:
+
+- `GET /v1/training/status`
+  - returns the same machine-readable operator report used by
+    `pylon training status --json`
+- `POST /v1/training/sync`
+  - runs the retained closeout and reputation sync lane and returns the sync
+    report
+- `POST /v1/training/node-record/refresh`
+  - republishes the retained `kind:39501` training node record for every
+    retained network and updates the stored publication pointer
+
+The node-side publication lane now has two explicit operator commands:
+
+- `pylon training publish [--manifest <path>]`
+  - publishes any retained node record, assignment receipt, and staged
+    artifact-locator state that does not already have persisted publication
+    pointers
+- `pylon training refresh [--json]`
+  - republishes only the retained node record on demand without replaying the
+    full receipt or artifact-locator publication sweep
+
+The retained config now also carries one explicit `training` block for the
+future admitted-node lane. That block freezes:
+
+- allowed training networks
+- role claims
+- local training run root
+- artifact credential-source names
+- checkpoint serve address
+- training authority URL
+- training relay list
+- validator enablement
+- disk quota and retention limits
+
+`Pylon` also now keeps one separate retained runtime-state file under the
+training run root at `state/runtime-state.json`. That store is intentionally
+separate from the inference ledger and is where cached training manifests,
+lease state, window state, active runtime state, latest published TRN ids,
+contribution outcomes, accepted closeouts, and retained reputation labels
+belong as the training shell grows.
+
 ## Prerequisites
 
 Minimum local requirements:
@@ -202,7 +435,7 @@ The first cut is intentionally small. It renders one full-screen transcript shel
 - a retained transcript area for local shell activity
 - a bottom textbox where plain text submits a prompt, `/help` shows the retained shell commands, `/model <model>` targets a Gemma runtime model for future local work, `/uninstall <model>` removes a local Gemma model, and `/download <model>` pulls a curated Gemma GGUF into the local Pylon cache
 
-The shell keeps submitted input in the transcript, streams the local Gemma reply back into the same view while it is generating, and carries prior user and assistant turns into the next prompt when local Gemma weights are available. The TUI prepends a plain-terminal system instruction on each local chat request so replies avoid Markdown and LaTeX formatting the transcript cannot render. The right column now shows a curated Hugging Face catalog for `gemma-4-e2b`, `gemma-4-e4b`, `gemma-4-26b-a4b`, and `gemma-4-31b`, with live per-model progress bars while downloads are active. Directly under that catalog, the `Pylon Operator` panel now projects the retained operator truth that matters during bring-up: whether the node is merely heartbeating presence or actively running intake, the current wallet total, 24-hour found and matching demand counts, 24-hour processed and settled counts, the last job result, and online uptime. Downloaded GGUFs land under `~/.openagents/pylon/models/huggingface/`. `/model <model>` persists a preferred Gemma target, maps it to the local runtime naming when possible, and warms that model through the configured local runtime endpoint. `/uninstall <model>` removes the matching cached GGUF and, when `local_gemma_base_url` points at a local Ollama instance, also removes the corresponding local runtime model. The current local chat path accepts the preferred model when it is visible through the configured local runtime endpoint. The `System` block is meant to show what the node can honestly report right now about local capacity and headroom. On Macs that includes power source and battery state. On NVIDIA hosts it can also show `power.draw / power.limit` from `nvidia-smi`. The current provider automation still lives in the explicit headless `cargo pylon-headless ...` flow below. `cargo run -p pylon-tui` remains the direct fallback if you want to bypass the alias.
+The shell keeps submitted input in the transcript, streams the local Gemma reply back into the same view while it is generating, and carries prior user and assistant turns into the next prompt when local Gemma weights are available. The TUI prepends a plain-terminal system instruction on each local chat request so replies avoid Markdown and LaTeX formatting the transcript cannot render. The right column now shows a curated Hugging Face catalog for `gemma-4-e2b`, `gemma-4-e4b`, `gemma-4-26b-a4b`, and `gemma-4-31b`, with live per-model progress bars while downloads are active. That catalog is intentionally separate from the live runtime truth: the `Gemma Models` panel now shows `runtime ready: ...` from the local backend before listing the optional local GGUF cache rows, so a healthy Ollama-loaded `gemma4:e4b` no longer looks "missing" just because no curated cache file was downloaded. Directly under that catalog, the `Pylon Operator` panel now projects the retained operator truth that matters during bring-up: whether the node is still coming online, idle and ready for jobs, actively running intake, or waiting on settlement, along with the current wallet total, 24-hour found and matching demand counts, 24-hour processed and settled counts, the last job result, and online uptime. The operator header now keeps the desired `mode` separate from the live `runtime`, drops the confusing standalone `state` line, and shows an idle online runtime as `ready` while the detail row explains that automatic intake passes are active. The first visible frame is also now neutral during bring-up: before the first status refresh lands, the shell shows `loading current status` instead of painting an offline-looking default state. Downloaded GGUFs land under `~/.openagents/pylon/models/huggingface/`. `/model <model>` persists a preferred Gemma target, maps it to the local runtime naming when possible, and warms that model through the configured local runtime endpoint. `/uninstall <model>` removes the matching cached GGUF and, when `local_gemma_base_url` points at a local Ollama instance, also removes the corresponding local runtime model. The current local chat path accepts the preferred model when it is visible through the configured local runtime endpoint. The `System` block is meant to show what the node can honestly report right now about local capacity and headroom. On Macs that includes power source and battery state. On NVIDIA hosts it can also show `power.draw / power.limit` from `nvidia-smi`. The normal provider automation now lives in the long-running `cargo pylon-headless serve` path below, while explicit `provider run` remains available as a manual one-shot pass. `cargo run -p pylon-tui` remains the direct fallback if you want to bypass the alias.
 
 When a node reports provider presence to `Nexus`, that same heartbeat now also
 carries a private hosting telemetry snapshot alongside the public-safe launch
@@ -249,25 +482,48 @@ The retained provider announcement controls now also exist in both places:
 The current retained announcement scope is one honest local text-generation handler for `kind:5050`. Pylon only publishes it when a local Gemma-backed text-generation path is actually eligible.
 When `cargo pylon-headless serve` is running and the node is `online` with
 eligible local Gemma supply, Pylon now auto-publishes or refreshes that handler
-announcement. `announce publish` remains the explicit manual path when you want
-to force the publish step yourself.
+announcement as part of the normal service loop. `announce publish` remains the
+explicit manual path when you want to force the publish step yourself.
 
 The retained provider intake controls also exist in both places:
 - TUI: `/provider scan [--seconds <n>]`, `/provider run [--seconds <n>]`
 - headless: `cargo pylon-headless provider scan [--seconds <n>]`, `cargo pylon-headless provider run [--seconds <n>]`
 
-The current retained execution scope is narrow and honest. Pylon subscribes to retained inbound `kind:5050` requests on the configured relays, filters targeted jobs, and only accepts work when the provider is online and a local Gemma text-generation path is actually ready. `scan` records intake decisions without executing. `run` has two honest paths:
+The current retained execution scope is narrow and honest. Pylon subscribes to retained inbound `kind:5050` requests on the configured relays, filters targeted jobs, and only accepts work when the provider is online and a local Gemma text-generation path is actually ready. When `cargo pylon-headless serve` is running in `online` mode, that service loop now performs short automatic provider-intake passes so the node actually processes eligible work without requiring a separate manual `provider run`. `scan` still records intake decisions without executing, and `run` remains the explicit one-shot operator path for debugging, manual replay, or forcing the next pass immediately. `run` has two honest paths:
 
 - for unpriced local work, it publishes a `kind:7000` processing update, executes accepted jobs locally, publishes the retained `kind:6050` result, and links those published event IDs back into the local ledger
 - for explicit paid requests, it stops at `payment-required`, creates a local Bolt11 invoice through the retained Spark wallet path, publishes that invoice in a `kind:7000` feedback event, and persists the amount plus Bolt11 string in the local ledger
 
 When that invoice is later marked paid in the local wallet, the next `provider run` picks the same job back up, records the settled payment, executes the work, publishes the retained result, and persists the settlement outcome. The retained `jobs`, `earnings`, `receipts`, and `activity` views now project that local NIP-90 provider settlement state directly from the Pylon ledger instead of forcing the operator to reconstruct it from relay logs.
 
+Repeated `provider run` passes now also keep durable replay protection in
+`processed-provider-requests.json` beside the rolling `ledger.json` window.
+That means old retained request IDs stay blocked even after they roll out of the
+recent `jobs` list, and intake subscriptions no longer fail the whole pass just
+because one configured relay in the pool is disconnected. The retained rule is:
+if at least one relay connects and subscribes, Pylon keeps the pass alive and
+dedupes against the durable processed-request set instead of only the bounded
+recent-job window.
+
 If the local wallet cannot create an invoice, the provider path fails honestly instead of pretending the request is payable.
 
 The retained wallet controls now also exist in both places:
 - TUI: `/wallet`, `/wallet balance`, `/wallet address`, `/wallet invoice <sats> [--description <text>]`, `/wallet pay <bolt11> [--amount-sats <n>]`, `/wallet history [--limit <n>]`
 - headless: `cargo pylon-headless wallet status|balance|address|invoice|pay|history`
+
+For operator accounting, the bounded retained `ledger.wallet.payments` list is
+no longer treated as the source of truth for credited totals. When `earnings`
+needs a local wallet fallback, Pylon now performs a full Spark payment-history
+sync, caches a compact credit summary under `ledger.wallet.credits`, and uses
+the original payment `created_at_ms` to decide what counts toward "today". That
+avoids both lifetime undercounting from the rolling 256-entry window and false
+"today" credits caused by later status refreshes rewriting `updated_at_ms`.
+
+The TUI operator sidebar now also treats wallet balance bring-up more honestly.
+Its refresh path loads network status plus balance first instead of waiting on
+recent payment history, and it renders `pending` when a zero balance is not yet
+authoritative. If a retained balance already exists, the sidebar keeps showing
+that cached total until a connected live balance replaces it.
 
 The retained provider payout controls now also exist in both places:
 - TUI: `/payout`, `/payout history [--limit <n>]`, `/payout withdraw <bolt11> [--amount-sats <n>]`
@@ -280,6 +536,14 @@ The retained transcript observability commands now also exist in the shell:
 - headless: `cargo pylon-headless jobs [--limit <n>]`, `cargo pylon-headless earnings`, `cargo pylon-headless receipts [--limit <n>]`, `cargo pylon-headless activity [--limit <n>]`
 
 Those views stay ledger-backed. They can still replay retained provider jobs, earnings, receipts, and relay activity even when there is no live provider service answering local HTTP routes.
+
+The retained ledger writes are now file-replace atomic, so the TUI and
+headless JSON views no longer transiently fall back to an empty local ledger
+while a concurrent provider pass is rewriting `ledger.json`. The `jobs` view
+also now overlays payment evidence from retained settlement rows onto matching
+job IDs, which means `payout_sats` and `payment_pointer` stay visible even when
+an older live recent-job row still says `completed_local` instead of carrying
+the later wallet credit detail itself.
 
 The first retained buyer controls now also exist in both places:
 - TUI: `/job submit [--bid-msats <n>] [--model <id>] [--provider <pubkey>] [--request-json <json>] <prompt>`, `/job watch [<request_event_id>] [--seconds <n>]`, `/job history [--limit <n>]`, `/job replay <request_event_id>`, `/job approve <request_event_id>`, `/job deny <request_event_id>`, `/job policy [show|auto|manual]`
@@ -424,6 +688,17 @@ The generated config currently includes:
 3. run `cargo pylon-headless serve` under a local service manager
 4. use `cargo pylon-headless status`, `backends`, `products`, `inventory`, `jobs`, `earnings`, `receipts`, and `activity` for observability
 5. use `cargo pylon-headless sandbox` when you need the declared runtime/profile view for bounded `sandbox_execution`
+
+While desired mode is `online`, the long-running `serve` loop is the normal
+operator path: it refreshes status, heartbeats provider presence, keeps the
+announcement current, and runs short automatic provider-intake passes against
+the configured relays. `provider run --seconds <n>` remains a manual one-shot
+pass rather than the normal way to keep an online node serving jobs.
+
+The plain-text `jobs` view is intentionally terminal-oriented: it prints older
+jobs first so the newest completed block lands closest to the shell prompt.
+Use `jobs --json` when you want the structured machine-readable report instead
+of the prompt-oriented text layout.
 
 ### `systemd` example
 

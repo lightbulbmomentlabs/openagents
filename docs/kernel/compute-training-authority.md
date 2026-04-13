@@ -98,17 +98,22 @@ The authority now also manages:
 
 - `ComputeTrainingRun`
   - canonical train run id, policy refs, environment binding, checkpoint
-    binding, validator posture, benchmark package refs, source linkage, step
-    expectations, terminal summaries, and checkpoint promotion refs
+    binding, validator posture, work class, replica type, benchmark package
+    refs, source linkage, step expectations, terminal summaries, and checkpoint
+    promotion refs
 - `ComputeAdapterTrainingWindow`
-  - canonical decentralized-adapter window projection linked to one
-    `ComputeTrainingRun`, including lifecycle state, validator score summary,
-    promotion readiness, promotion lineage, and optional accepted-outcome
-    linkage
+  - canonical training-window projection linked to one `ComputeTrainingRun`,
+    including lifecycle state, validator score summary, promotion readiness,
+    promotion lineage, declared work class, declared replica type, round index,
+    base-checkpoint lineage, planned local-work semantics, aggregation rule and
+    weighting basis, optional accepted aggregate identity, optional promoted
+    checkpoint identity, and optional accepted-outcome linkage
 - `ComputeAdapterContributionOutcome`
   - canonical contribution-level projection linked to one
     `ComputeAdapterTrainingWindow`, including manifest/object digests, validator
-    disposition, aggregation eligibility, aggregation weight, and preserved
+    disposition, aggregation eligibility, contribution work class, contribution
+    replica type, base-checkpoint lineage, local-step or token or example
+    accounting, aggregation weight basis and value, and preserved
     submission/artifact/provenance/security/validator receipt digests
 - `ComputeAcceptedOutcome`
   - canonical accepted-outcome id for either:
@@ -137,6 +142,197 @@ execution receipts into operator and settlement-facing truth:
   from those receipts
 - accepted outcomes remain the only canonical promotion boundary for later
   market settlement or accepted operator claims
+
+The current type names still carry the historical adapter-first naming, but the
+authority semantics no longer do. Windows and contributions now carry explicit
+round, checkpoint, local-work, and aggregation fields directly so the same
+sealed closeout path can describe adapter windows, grouped stages, or island
+local-update rounds without inferring those semantics from opaque metadata.
+
+## Operator Summary And Public Stats Projection
+
+Nexus now projects training state into two explicit read-model buckets instead
+of one blended counter set:
+
+- participation
+  - admitted nodes
+  - online nodes
+  - active runs
+  - active windows
+  - pending-validation windows
+  - open or queued validator challenges
+- progress
+  - runs with accepted progress
+  - accepted closeouts
+  - nodes that contributed to accepted progress
+  - windows that advanced checkpoint lineage
+  - payout-eligible closeouts
+  - checkpoint-age and artifact-failure signals
+
+This split is deliberate.
+
+- participation answers who is present and what coordination load is live
+- progress answers what actually produced accepted state
+
+The public `/stats`, `/api/stats`, `/api/training/summary`, and homepage
+snapshots should expose both categories without collapsing them into one
+"activity" number. A rewarded or accepted closeout can exist without advancing
+checkpoint lineage, and a busy validator queue can exist without any accepted
+progress.
+
+## Visualization Snapshot
+
+Nexus now also exposes one visualization-oriented training read model at:
+
+- `/api/training/visualization`
+
+The homepage payload mirrors the same object at:
+
+- `/api/homepage.training_visualization`
+
+This snapshot is the public/operator surface intended for WGPUI and future
+homepage or stats-page visualizations. It keeps the stable counters from
+`/api/training/summary`, but widens the shape so consumers do not need to
+reconstruct training state from scheduler internals.
+
+The visualization snapshot now projects:
+
+- capability-tier buckets
+  - node totals, online totals, eligible totals
+  - role mix, networks, backend families, throughput bands, replay capability,
+    and upload-latency classes per tier
+- run state
+  - work class, replica type, progress class
+  - required worker, validator, and recovery-source tiers
+  - active window ids, latest aggregate ref, and latest promoted checkpoint ref
+- window state
+  - round index, base checkpoint, planned local-step count
+  - aggregation rule and weighting basis
+  - validator pressure per window
+  - aggregate digest or aggregate id
+  - output or promoted checkpoint refs
+  - accepted closeout linkage, payout eligibility, and contributor tier mix
+- validator state
+  - open, queued, leased, retrying, verified, rejected, and timed-out counts
+  - per-window challenge grouping when the challenge id binds to one training
+    window
+- aggregate, checkpoint, and closeout projections
+  - aggregate refs with closeout status, payout eligibility, and
+    weak-device-bearing flags
+  - checkpoint refs by role such as `base`, `accepted_closeout`, `promoted`,
+    and `run_latest`
+  - closeouts with work class, progress class, payout basis, payout projection,
+    contributor tiers, weak-device-bearing state, and accepted checkpoint refs
+
+This is the authority-facing answer to the UI request for:
+
+- tier visualization
+- active windows and validation pressure
+- accepted aggregates and promoted checkpoints
+- participation versus progress
+- payout references that stay legible after closeout
+
+## Work-Class Settlement Projection
+
+The accepted-outcome closeout record now also carries explicit settlement
+projection metadata so operators do not need private runbook knowledge to infer
+why a rewarded window paid anyone.
+
+Each training closeout should now publish:
+
+- `work_class`
+  - for example `validation_replay`, `grouped_replica_stage_execution`, or
+    `full_island_local_update_training`
+- `replica_type`
+  - `single_node`, `island`, or `grouped_replica`
+- `progress_class`
+  - `participation_only`, `model_update`, or `checkpoint_advance`
+- `payout_projection`
+  - machine-legible payout basis such as:
+    - `validator_verdict`
+    - `accepted_contribution`
+    - `aggregation_weight`
+    - `grouped_stage_share`
+    - `aggregate_acceptance`
+    - `checkpoint_authority`
+  - optional weighting basis and total weighted value
+  - whether one accepted result is shared across multiple contributors
+  - one projected participant list with contribution identity and share basis
+- `contributor_tiers`
+  - minimum and maximum admitted contributor capability tiers counted for
+    settlement
+  - per-tier participant counts for the accepted outcome
+  - one `weak_device_bearing` flag when the accepted settlement includes any
+    contributor below `tier3_island`
+
+This is the public authority answer to two different questions that were
+previously conflated:
+
+- did this work advance model state?
+- did this work earn payout?
+
+For example:
+
+- validation replay can now be payout-eligible while remaining
+  `participation_only`
+- grouped replica stage execution can now surface one shared accepted result
+  with split attribution across multiple nodes and expose whether the accepted
+  lane actually included weaker consumer-device tiers
+- aggregation or checkpoint-promotion lanes can be payout-eligible and still be
+  classified as checkpoint-advance work rather than raw local training
+
+The top-level training summary should therefore expose:
+
+- progress-only counts
+  - accepted progress closeouts
+  - runs with accepted progress
+  - nodes contributing to accepted progress
+- settlement counts
+  - accepted closeouts regardless of progress class
+  - payout-eligible closeouts regardless of progress class
+  - work-class breakdowns so participation-only payout lanes stay legible
+
+## Launch default weak-device lane
+
+For the current Transcript 222 launch-hardening window, the default weak-device
+lane is `validation_replay`.
+
+That launch freeze means the authority, stats, and payout surfaces should treat
+`validation_replay` as the first weak-device work class that is expected to:
+
+- admit lower-tier nodes than the dense training lane
+- produce real retained validator artifacts and receipts
+- count toward assigned and accepted weak-device work
+- remain `participation_only` unless a later closeout contract explicitly says
+  otherwise
+
+The launch freeze also means grouped-replica stage execution is not a hidden
+launch dependency. The authority schema should keep supporting it, but launch
+truth, product language, and public stats must not imply that grouped replicas
+are already required before the weak-device claim is honest.
+
+## Trust And Quorum Rules
+
+The current control plane now treats overlap and promotion authority as
+first-class invariants instead of operator convention.
+
+- one node cannot hold conflicting active roles on the same run
+  - worker plus validator is forbidden
+  - worker plus recovery source is forbidden
+  - validator plus recovery source is forbidden
+- validators cannot lease challenges against assignments they contributed
+- promotion-bearing closeouts must satisfy validator quorum explicitly
+- promotion-bearing closeouts must wait out the validator challenge window
+  before Nexus treats the checkpoint as canonization-ready
+
+In practice that means:
+
+- non-promotion closeouts can still finalize accepted work without pretending a
+  new canonical checkpoint exists
+- promotion requests stay held until the validator policy's minimum distinct
+  validator count and challenge-window requirements are both satisfied
+- the defensibility audit records the promotion posture, counted validators,
+  contributor identities, and any refused overlap
 
 ## Current Apple Operator Path
 
@@ -194,6 +390,9 @@ The important rule is simple:
 - the checkpoint family must match the training policy
 - the validator policy must match the training policy
 - the environment must be permitted by the training policy
+- the declared work class and replica type must be coherent for the run:
+  - grouped replica stage execution requires `grouped_replica`
+  - full-island local-update training requires `island`
 - benchmark packages must exist and match the resolved environment
 - Apple benchmark packages may satisfy that environment check either by matching
   the run's top-level environment directly or, for benchmark-split packages, by
@@ -220,6 +419,36 @@ The important rule is simple:
   plus the runtime-validation eval ref when the Apple runtime-validation
   posture requires runtime smoke
 
+### Training window record
+
+- window records require one explicit `base_checkpoint_ref`
+- the explicit `base_checkpoint_ref` must match the source checkpoint pointer
+- optional `round_index` and `planned_local_step_count` become part of the
+  canonical authority object rather than metadata-only hints
+- optional `aggregation_rule` and `aggregation_weight_basis` must either both
+  be present or both be absent
+- adapter-target and adapter-format fields remain required for
+  `adapter_training`, but non-adapter work classes can persist empty adapter
+  naming fields while still carrying the same window lifecycle
+- `window_summary_digest` now covers the window's work class, replica type,
+  round, base-checkpoint, aggregation semantics, accepted aggregate linkage,
+  promoted checkpoint linkage, accepted outcome linkage, and contribution-level
+  local-work accounting fields
+
+### Contribution outcome record
+
+- contribution records require one explicit `base_checkpoint_ref`
+- the explicit `base_checkpoint_ref` must match the source checkpoint pointer
+- contribution work class and replica type must remain coherent with the parent
+  run or window topology rules
+- local-step count, token count, example count, and aggregation weight value
+  must be positive when present
+- aggregation weight basis and value must either both be present or both be
+  absent
+- adapter dataset slices remain required for `adapter_training`, but non-adapter
+  contributions can persist default slices while preserving the same receipt and
+  lineage surface
+
 ### Accepted outcomes
 
 - evaluation outcomes require a finalized `ComputeEvaluationRun`
@@ -243,6 +472,8 @@ The important rule is simple:
 - recording one adapter window requires an existing `ComputeTrainingRun`
 - the window validator policy must match the source training run validator
   policy
+- the window work class and replica type are durable control-plane fields, not
+  inferred metadata
 - each contribution recorded with the window must bind to the same:
   - training run
   - stage id
@@ -268,6 +499,42 @@ The important rule is simple:
 - re-recording the same window id replaces the current contribution projection
   set for that window, so one authority record can move from provisional window
   truth to accepted-outcome-linked truth without inventing parallel local state
+
+### Admitted training nodes and scheduler projection
+
+Outside the kernel registry objects, Nexus also persists one admitted-node
+read model for the training scheduler and public operator surfaces.
+
+Each admitted training node now preserves:
+
+- retained role claims and allowed networks
+- contributor-availability contract fields
+- one capability-tier profile with:
+  - capability tier (`tier0_presence` through `tier4_authority`)
+  - backend families and accelerator inventory
+  - memory floor and available memory
+  - throughput band
+  - lease reliability class
+  - replay capability
+  - artifact upload latency class
+- retained build and environment identity
+- last observed runtime, lease, heartbeat, and settlement destination state
+
+That projection is intentionally scheduler-readable. Nexus can match nodes
+against run requirements without reverse-engineering raw host telemetry from
+opaque metadata blobs or relay-only side channels.
+
+Scheduler matching now consumes that admitted-node profile together with the
+training run's declared `work_class` and `replica_type`. Lease assignment
+therefore fails closed on explicit mismatches such as:
+
+- backend-family mismatch
+- environment mismatch
+- work-class tier insufficiency
+- replica-type tier insufficiency
+
+This keeps scheduler refusal semantics legible instead of collapsing every
+missed assignment into a generic "run not found" path.
 
 ## HTTP Authority Surface
 
@@ -354,3 +621,7 @@ Psionic still owns the runtime truth for:
 
 Kernel and Nexus now own the canonical authority publication layer that turns
 those runtime results into durable policy, receipt, and accepted-outcome truth.
+That public lane now includes typed TRN `kind:39520` artifact locators for
+accepted local updates, reconciled aggregates, and promoted checkpoints so the
+relay-visible control plane carries round lineage and artifact roles without
+embedding the underlying training bytes.

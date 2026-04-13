@@ -17,7 +17,8 @@ pub use sandbox_execution::*;
 
 use openagents_kernel_core::compute::{
     ComputeAdapterAggregationEligibility, ComputeAdapterContributionDisposition,
-    ComputeAdapterContributionOutcome, ComputeAdapterTrainingWindow,
+    ComputeAdapterContributionOutcome, ComputeAdapterTrainingWindow, ComputeTrainingReplicaType,
+    ComputeTrainingWorkClass,
 };
 use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -82,6 +83,8 @@ pub enum ProviderBlocker {
     GptOssModelUnavailable,
     AppleFoundationModelsUnavailable,
     AppleFoundationModelsModelUnavailable,
+    PylonAuthorityUnavailable,
+    PylonProviderOffline,
 }
 
 impl ProviderBlocker {
@@ -95,6 +98,8 @@ impl ProviderBlocker {
             Self::GptOssModelUnavailable => "LOCAL_GEMMA_MODEL_UNAVAILABLE",
             Self::AppleFoundationModelsUnavailable => "APPLE_FM_UNAVAILABLE",
             Self::AppleFoundationModelsModelUnavailable => "APPLE_FM_MODEL_UNAVAILABLE",
+            Self::PylonAuthorityUnavailable => "PYLON_AUTHORITY_UNAVAILABLE",
+            Self::PylonProviderOffline => "PYLON_PROVIDER_OFFLINE",
         }
     }
 
@@ -111,6 +116,12 @@ impl ProviderBlocker {
             }
             Self::AppleFoundationModelsModelUnavailable => {
                 "Apple Foundation Models is not ready to serve inference"
+            }
+            Self::PylonAuthorityUnavailable => {
+                "Pylon provider authority is unavailable; live earnings cannot be tracked"
+            }
+            Self::PylonProviderOffline => {
+                "Pylon provider is reachable but desired_mode is offline; incoming jobs will be dropped"
             }
         }
     }
@@ -541,6 +552,252 @@ impl ProviderAdapterTrainingContributorAvailability {
             self.coordinator_match_supported,
             self.authority_receipt_supported,
         )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTrainingCapabilityTier {
+    #[default]
+    Tier0Presence,
+    Tier1Validation,
+    Tier2Trainer,
+    Tier3Island,
+    Tier4Authority,
+}
+
+impl ProviderTrainingCapabilityTier {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tier0Presence => "tier0_presence",
+            Self::Tier1Validation => "tier1_validation",
+            Self::Tier2Trainer => "tier2_trainer",
+            Self::Tier3Island => "tier3_island",
+            Self::Tier4Authority => "tier4_authority",
+        }
+    }
+
+    pub const fn ordinal(self) -> u8 {
+        match self {
+            Self::Tier0Presence => 0,
+            Self::Tier1Validation => 1,
+            Self::Tier2Trainer => 2,
+            Self::Tier3Island => 3,
+            Self::Tier4Authority => 4,
+        }
+    }
+
+    pub const fn meets(self, minimum: Self) -> bool {
+        self.ordinal() >= minimum.ordinal()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTrainingThroughputBand {
+    #[default]
+    Unknown,
+    Low,
+    Medium,
+    High,
+    Island,
+}
+
+impl ProviderTrainingThroughputBand {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Island => "island",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTrainingLeaseReliabilityClass {
+    #[default]
+    Unknown,
+    Unproven,
+    Steady,
+    Strong,
+}
+
+impl ProviderTrainingLeaseReliabilityClass {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Unproven => "unproven",
+            Self::Steady => "steady",
+            Self::Strong => "strong",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTrainingReplayCapability {
+    #[default]
+    None,
+    ShortWindow,
+    FullWindow,
+}
+
+impl ProviderTrainingReplayCapability {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::ShortWindow => "short_window",
+            Self::FullWindow => "full_window",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTrainingArtifactUploadLatencyClass {
+    #[default]
+    Unknown,
+    Slow,
+    Moderate,
+    Fast,
+}
+
+impl ProviderTrainingArtifactUploadLatencyClass {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Slow => "slow",
+            Self::Moderate => "moderate",
+            Self::Fast => "fast",
+        }
+    }
+}
+
+pub const PROVIDER_TRAINING_CAPABILITY_ENVELOPE_V2_SCHEMA_VERSION: &str =
+    "provider.training_capability_envelope.v2";
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTrainingAcceleratorInventoryEntry {
+    pub backend_family: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    pub accelerator_count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_per_accelerator_gb: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTrainingCapabilityTierProfile {
+    #[serde(default)]
+    pub tier: ProviderTrainingCapabilityTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backend_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accelerator_inventory: Vec<ProviderTrainingAcceleratorInventoryEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_floor_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_memory_gb: Option<u32>,
+    #[serde(default)]
+    pub throughput_band: ProviderTrainingThroughputBand,
+    #[serde(default)]
+    pub lease_reliability: ProviderTrainingLeaseReliabilityClass,
+    #[serde(default)]
+    pub replay_capability: ProviderTrainingReplayCapability,
+    #[serde(default)]
+    pub artifact_upload_latency_class: ProviderTrainingArtifactUploadLatencyClass,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTrainingWorkClassEligibility {
+    pub work_class: ComputeTrainingWorkClass,
+    #[serde(default)]
+    pub minimum_tier: ProviderTrainingCapabilityTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replica_types: Vec<ComputeTrainingReplicaType>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_backend_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_memory_gb: Option<u32>,
+    #[serde(default)]
+    pub required_throughput_band: ProviderTrainingThroughputBand,
+    #[serde(default)]
+    pub required_replay_capability: ProviderTrainingReplayCapability,
+    #[serde(default)]
+    pub benchmark_lane_required: bool,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTrainingReplicaTypeEligibility {
+    pub replica_type: ComputeTrainingReplicaType,
+    #[serde(default)]
+    pub minimum_tier: ProviderTrainingCapabilityTier,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_backend_families: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_memory_gb: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProviderTrainingCapabilityEnvelopeV2 {
+    pub schema_version: String,
+    #[serde(default)]
+    pub tier_profile: ProviderTrainingCapabilityTierProfile,
+    #[serde(default)]
+    pub runtime_surface_detected: bool,
+    #[serde(default)]
+    pub contributor_supported: bool,
+    #[serde(default)]
+    pub benchmark_lane_available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eligible_work_classes: Vec<ProviderTrainingWorkClassEligibility>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eligible_replica_types: Vec<ProviderTrainingReplicaTypeEligibility>,
+}
+
+impl Default for ProviderTrainingCapabilityEnvelopeV2 {
+    fn default() -> Self {
+        Self {
+            schema_version: PROVIDER_TRAINING_CAPABILITY_ENVELOPE_V2_SCHEMA_VERSION.to_string(),
+            tier_profile: ProviderTrainingCapabilityTierProfile::default(),
+            runtime_surface_detected: false,
+            contributor_supported: false,
+            benchmark_lane_available: false,
+            eligible_work_classes: Vec::new(),
+            eligible_replica_types: Vec::new(),
+        }
+    }
+}
+
+impl ProviderTrainingCapabilityEnvelopeV2 {
+    pub fn supports_work_class(&self, work_class: ComputeTrainingWorkClass) -> bool {
+        self.eligible_work_classes
+            .iter()
+            .any(|entry| entry.work_class == work_class)
+    }
+
+    pub fn supports_replica_type(&self, replica_type: ComputeTrainingReplicaType) -> bool {
+        self.eligible_replica_types
+            .iter()
+            .any(|entry| entry.replica_type == replica_type)
+    }
+
+    pub fn eligible_work_class_labels(&self) -> Vec<String> {
+        self.eligible_work_classes
+            .iter()
+            .map(|entry| entry.work_class.label().to_string())
+            .collect()
+    }
+
+    pub fn eligible_replica_type_labels(&self) -> Vec<String> {
+        self.eligible_replica_types
+            .iter()
+            .map(|entry| entry.replica_type.label().to_string())
+            .collect()
     }
 }
 
@@ -2136,7 +2393,8 @@ mod tests {
         ComputeAdapterAggregationEligibility, ComputeAdapterContributionDisposition,
         ComputeAdapterContributionOutcome, ComputeAdapterDatasetSlice,
         ComputeAdapterPolicyRevision, ComputeAdapterPromotionDisposition,
-        ComputeAdapterTrainingWindow, ComputeAdapterWindowStatus,
+        ComputeAdapterTrainingWindow, ComputeAdapterWindowStatus, ComputeTrainingReplicaType,
+        ComputeTrainingWorkClass,
     };
 
     fn ensure(condition: bool, message: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -2193,6 +2451,13 @@ mod tests {
             stage_id: "sft".to_string(),
             contributor_set_revision_id: "contributors.rev.1".to_string(),
             validator_policy_ref: "policy://validator/apple_adapter/helpdesk".to_string(),
+            work_class: ComputeTrainingWorkClass::AdapterTraining,
+            replica_type: ComputeTrainingReplicaType::SingleNode,
+            round_index: Some(7),
+            base_checkpoint_ref: "checkpoint://apple_adapter/base".to_string(),
+            planned_local_step_count: Some(32),
+            aggregation_rule: Some("weighted_avg".to_string()),
+            aggregation_weight_basis: Some("tokens".to_string()),
             adapter_target_id: "adapter.target.helpdesk".to_string(),
             adapter_family: "apple.foundation_models".to_string(),
             base_model_ref: "model://apple.foundation".to_string(),
@@ -2232,8 +2497,10 @@ mod tests {
             promotion_disposition: Some(ComputeAdapterPromotionDisposition::Promoted),
             hold_reason_codes: Vec::new(),
             aggregated_delta_digest: Some("sha256:aggregate".to_string()),
+            accepted_aggregate_id: Some("aggregate.window.alpha".to_string()),
             output_policy_revision: None,
             output_checkpoint_pointer: None,
+            promoted_checkpoint_ref: None,
             accepted_outcome_id: Some("accepted.training.apple.alpha".to_string()),
             recorded_at_ms: 1_762_000_000_020,
             metadata: serde_json::Value::Null,
@@ -2251,6 +2518,9 @@ mod tests {
             contributor_node_id: "node.alpha".to_string(),
             worker_id: "worker.alpha".to_string(),
             validator_policy_ref: "policy://validator/apple_adapter/helpdesk".to_string(),
+            work_class: ComputeTrainingWorkClass::AdapterTraining,
+            replica_type: ComputeTrainingReplicaType::SingleNode,
+            base_checkpoint_ref: "checkpoint://apple_adapter/base".to_string(),
             adapter_target_id: "adapter.target.helpdesk".to_string(),
             adapter_family: "apple.foundation_models".to_string(),
             base_model_ref: "model://apple.foundation".to_string(),
@@ -2292,6 +2562,11 @@ mod tests {
             validator_receipt_digest: "sha256:validator".to_string(),
             aggregation_eligibility: ComputeAdapterAggregationEligibility::Eligible,
             accepted_for_aggregation: true,
+            local_step_count: Some(32),
+            consumed_token_count: Some(65_536),
+            consumed_example_count: Some(128),
+            aggregation_weight_basis: Some("tokens".to_string()),
+            aggregation_weight_value: Some(65_536),
             aggregation_weight_bps: Some(10_000),
             promotion_receipt_digest: Some("sha256:promotion".to_string()),
             recorded_at_ms: 1_762_000_000_020,

@@ -47,7 +47,8 @@ use crate::compute::{
     ComputeProvisioningKind, ComputeRegistryStatus, ComputeSettlementFailureReason,
     ComputeSettlementMode, ComputeSyntheticDataJob, ComputeSyntheticDataJobStatus,
     ComputeSyntheticDataSample, ComputeSyntheticDataSampleStatus, ComputeTopologyKind,
-    ComputeTrainingPolicy, ComputeTrainingRun, ComputeTrainingRunStatus, ComputeTrainingSummary,
+    ComputeTrainingPolicy, ComputeTrainingReplicaType, ComputeTrainingRun,
+    ComputeTrainingRunStatus, ComputeTrainingSummary, ComputeTrainingWorkClass,
     ComputeValidatorPolicy, ComputeValidatorRequirements, DeliveryProof, DeliveryProofStatus,
     DeliveryRejectionReason, DeliverySandboxEvidence, DeliveryTopologyEvidence,
     DeliveryVerificationEvidence, GptOssRuntimeCapability, StructuredCapacityInstrument,
@@ -675,6 +676,94 @@ fn compute_evaluation_sample_status_from_proto(value: i32) -> ComputeEvaluationS
         proto_compute::ComputeEvaluationSampleStatus::Unspecified
         | proto_compute::ComputeEvaluationSampleStatus::Recorded => {
             ComputeEvaluationSampleStatus::Recorded
+        }
+    }
+}
+
+fn compute_training_work_class_to_proto(value: ComputeTrainingWorkClass) -> i32 {
+    match value {
+        ComputeTrainingWorkClass::ValidationReplay => {
+            proto_compute::ComputeTrainingWorkClass::ValidationReplay as i32
+        }
+        ComputeTrainingWorkClass::Evaluation => {
+            proto_compute::ComputeTrainingWorkClass::Evaluation as i32
+        }
+        ComputeTrainingWorkClass::AdapterTraining => {
+            proto_compute::ComputeTrainingWorkClass::AdapterTraining as i32
+        }
+        ComputeTrainingWorkClass::SmallModelLocalTraining => {
+            proto_compute::ComputeTrainingWorkClass::SmallModelLocalTraining as i32
+        }
+        ComputeTrainingWorkClass::GroupedReplicaStageExecution => {
+            proto_compute::ComputeTrainingWorkClass::GroupedReplicaStageExecution as i32
+        }
+        ComputeTrainingWorkClass::FullIslandLocalUpdateTraining => {
+            proto_compute::ComputeTrainingWorkClass::FullIslandLocalUpdateTraining as i32
+        }
+        ComputeTrainingWorkClass::Aggregation => {
+            proto_compute::ComputeTrainingWorkClass::Aggregation as i32
+        }
+        ComputeTrainingWorkClass::CheckpointPromotion => {
+            proto_compute::ComputeTrainingWorkClass::CheckpointPromotion as i32
+        }
+    }
+}
+
+fn compute_training_work_class_from_proto(value: i32) -> ComputeTrainingWorkClass {
+    match proto_compute::ComputeTrainingWorkClass::try_from(value)
+        .unwrap_or(proto_compute::ComputeTrainingWorkClass::AdapterTraining)
+    {
+        proto_compute::ComputeTrainingWorkClass::ValidationReplay => {
+            ComputeTrainingWorkClass::ValidationReplay
+        }
+        proto_compute::ComputeTrainingWorkClass::Evaluation => ComputeTrainingWorkClass::Evaluation,
+        proto_compute::ComputeTrainingWorkClass::SmallModelLocalTraining => {
+            ComputeTrainingWorkClass::SmallModelLocalTraining
+        }
+        proto_compute::ComputeTrainingWorkClass::GroupedReplicaStageExecution => {
+            ComputeTrainingWorkClass::GroupedReplicaStageExecution
+        }
+        proto_compute::ComputeTrainingWorkClass::FullIslandLocalUpdateTraining => {
+            ComputeTrainingWorkClass::FullIslandLocalUpdateTraining
+        }
+        proto_compute::ComputeTrainingWorkClass::Aggregation => {
+            ComputeTrainingWorkClass::Aggregation
+        }
+        proto_compute::ComputeTrainingWorkClass::CheckpointPromotion => {
+            ComputeTrainingWorkClass::CheckpointPromotion
+        }
+        proto_compute::ComputeTrainingWorkClass::Unspecified
+        | proto_compute::ComputeTrainingWorkClass::AdapterTraining => {
+            ComputeTrainingWorkClass::AdapterTraining
+        }
+    }
+}
+
+fn compute_training_replica_type_to_proto(value: ComputeTrainingReplicaType) -> i32 {
+    match value {
+        ComputeTrainingReplicaType::SingleNode => {
+            proto_compute::ComputeTrainingReplicaType::SingleNode as i32
+        }
+        ComputeTrainingReplicaType::Island => {
+            proto_compute::ComputeTrainingReplicaType::Island as i32
+        }
+        ComputeTrainingReplicaType::GroupedReplica => {
+            proto_compute::ComputeTrainingReplicaType::GroupedReplica as i32
+        }
+    }
+}
+
+fn compute_training_replica_type_from_proto(value: i32) -> ComputeTrainingReplicaType {
+    match proto_compute::ComputeTrainingReplicaType::try_from(value)
+        .unwrap_or(proto_compute::ComputeTrainingReplicaType::SingleNode)
+    {
+        proto_compute::ComputeTrainingReplicaType::Island => ComputeTrainingReplicaType::Island,
+        proto_compute::ComputeTrainingReplicaType::GroupedReplica => {
+            ComputeTrainingReplicaType::GroupedReplica
+        }
+        proto_compute::ComputeTrainingReplicaType::Unspecified
+        | proto_compute::ComputeTrainingReplicaType::SingleNode => {
+            ComputeTrainingReplicaType::SingleNode
         }
     }
 }
@@ -2754,6 +2843,8 @@ pub fn compute_training_run_to_proto(
         )),
         checkpoint_binding: Some(compute_checkpoint_binding_to_proto(&run.checkpoint_binding)),
         validator_policy_ref: run.validator_policy_ref.clone(),
+        work_class: compute_training_work_class_to_proto(run.work_class),
+        replica_type: compute_training_replica_type_to_proto(run.replica_type),
         benchmark_package_refs: run.benchmark_package_refs.clone(),
         product_id: run.product_id.clone(),
         capacity_lot_id: run.capacity_lot_id.clone(),
@@ -2796,6 +2887,8 @@ pub fn compute_training_run_from_proto(
                 .ok_or_else(|| missing("checkpoint_binding"))?,
         ),
         validator_policy_ref: run.validator_policy_ref.clone(),
+        work_class: compute_training_work_class_from_proto(run.work_class),
+        replica_type: compute_training_replica_type_from_proto(run.replica_type),
         benchmark_package_refs: run
             .benchmark_package_refs
             .iter()
@@ -2986,6 +3079,8 @@ pub fn compute_adapter_training_window_to_proto(
         stage_id: window.stage_id.clone(),
         contributor_set_revision_id: window.contributor_set_revision_id.clone(),
         validator_policy_ref: window.validator_policy_ref.clone(),
+        work_class: compute_training_work_class_to_proto(window.work_class),
+        replica_type: compute_training_replica_type_to_proto(window.replica_type),
         adapter_target_id: window.adapter_target_id.clone(),
         adapter_family: window.adapter_family.clone(),
         base_model_ref: window.base_model_ref.clone(),
@@ -3036,6 +3131,13 @@ pub fn compute_adapter_training_window_to_proto(
         accepted_outcome_id: window.accepted_outcome_id.clone(),
         recorded_at_ms: window.recorded_at_ms,
         metadata_json: json_value_to_string(&window.metadata)?,
+        round_index: window.round_index,
+        base_checkpoint_ref: window.base_checkpoint_ref.clone(),
+        planned_local_step_count: window.planned_local_step_count,
+        aggregation_rule: window.aggregation_rule.clone(),
+        aggregation_weight_basis: window.aggregation_weight_basis.clone(),
+        accepted_aggregate_id: window.accepted_aggregate_id.clone(),
+        promoted_checkpoint_ref: window.promoted_checkpoint_ref.clone(),
     })
 }
 
@@ -3048,6 +3150,13 @@ pub fn compute_adapter_training_window_from_proto(
         stage_id: window.stage_id.clone(),
         contributor_set_revision_id: window.contributor_set_revision_id.clone(),
         validator_policy_ref: window.validator_policy_ref.clone(),
+        work_class: compute_training_work_class_from_proto(window.work_class),
+        replica_type: compute_training_replica_type_from_proto(window.replica_type),
+        round_index: window.round_index,
+        base_checkpoint_ref: window.base_checkpoint_ref.clone(),
+        planned_local_step_count: window.planned_local_step_count,
+        aggregation_rule: optional_string_as_none(window.aggregation_rule.clone()),
+        aggregation_weight_basis: optional_string_as_none(window.aggregation_weight_basis.clone()),
         adapter_target_id: window.adapter_target_id.clone(),
         adapter_family: window.adapter_family.clone(),
         base_model_ref: window.base_model_ref.clone(),
@@ -3091,6 +3200,7 @@ pub fn compute_adapter_training_window_from_proto(
             .filter_map(|value| compute_adapter_promotion_hold_reason_code_from_proto(*value))
             .collect(),
         aggregated_delta_digest: optional_string_as_none(window.aggregated_delta_digest.clone()),
+        accepted_aggregate_id: optional_string_as_none(window.accepted_aggregate_id.clone()),
         output_policy_revision: window
             .output_policy_revision
             .as_ref()
@@ -3101,6 +3211,7 @@ pub fn compute_adapter_training_window_from_proto(
             .as_ref()
             .map(compute_adapter_checkpoint_pointer_from_proto)
             .transpose()?,
+        promoted_checkpoint_ref: optional_string_as_none(window.promoted_checkpoint_ref.clone()),
         accepted_outcome_id: optional_string_as_none(window.accepted_outcome_id.clone()),
         recorded_at_ms: window.recorded_at_ms,
         metadata: json_string_to_value(window.metadata_json.as_str())?,
@@ -3120,6 +3231,9 @@ pub fn compute_adapter_contribution_outcome_to_proto(
         contributor_node_id: contribution.contributor_node_id.clone(),
         worker_id: contribution.worker_id.clone(),
         validator_policy_ref: contribution.validator_policy_ref.clone(),
+        work_class: compute_training_work_class_to_proto(contribution.work_class),
+        replica_type: compute_training_replica_type_to_proto(contribution.replica_type),
+        base_checkpoint_ref: contribution.base_checkpoint_ref.clone(),
         adapter_target_id: contribution.adapter_target_id.clone(),
         adapter_family: contribution.adapter_family.clone(),
         base_model_ref: contribution.base_model_ref.clone(),
@@ -3154,6 +3268,11 @@ pub fn compute_adapter_contribution_outcome_to_proto(
             contribution.aggregation_eligibility,
         ),
         accepted_for_aggregation: contribution.accepted_for_aggregation,
+        local_step_count: contribution.local_step_count,
+        consumed_token_count: contribution.consumed_token_count,
+        consumed_example_count: contribution.consumed_example_count,
+        aggregation_weight_basis: contribution.aggregation_weight_basis.clone(),
+        aggregation_weight_value: contribution.aggregation_weight_value,
         aggregation_weight_bps: contribution.aggregation_weight_bps,
         promotion_receipt_digest: contribution.promotion_receipt_digest.clone(),
         recorded_at_ms: contribution.recorded_at_ms,
@@ -3174,6 +3293,9 @@ pub fn compute_adapter_contribution_outcome_from_proto(
         contributor_node_id: contribution.contributor_node_id.clone(),
         worker_id: contribution.worker_id.clone(),
         validator_policy_ref: contribution.validator_policy_ref.clone(),
+        work_class: compute_training_work_class_from_proto(contribution.work_class),
+        replica_type: compute_training_replica_type_from_proto(contribution.replica_type),
+        base_checkpoint_ref: contribution.base_checkpoint_ref.clone(),
         adapter_target_id: contribution.adapter_target_id.clone(),
         adapter_family: contribution.adapter_family.clone(),
         base_model_ref: contribution.base_model_ref.clone(),
@@ -3219,6 +3341,13 @@ pub fn compute_adapter_contribution_outcome_from_proto(
             contribution.aggregation_eligibility,
         ),
         accepted_for_aggregation: contribution.accepted_for_aggregation,
+        local_step_count: contribution.local_step_count,
+        consumed_token_count: contribution.consumed_token_count,
+        consumed_example_count: contribution.consumed_example_count,
+        aggregation_weight_basis: optional_string_as_none(
+            contribution.aggregation_weight_basis.clone(),
+        ),
+        aggregation_weight_value: contribution.aggregation_weight_value,
         aggregation_weight_bps: contribution.aggregation_weight_bps,
         promotion_receipt_digest: optional_string_as_none(
             contribution.promotion_receipt_digest.clone(),
@@ -6394,14 +6523,19 @@ mod tests {
         finalize_compute_synthetic_data_generation_request_to_proto,
         finalize_compute_synthetic_data_generation_response_from_proto,
         finalize_compute_synthetic_data_generation_response_to_proto,
+        get_compute_adapter_training_window_response_from_proto,
+        get_compute_adapter_training_window_response_to_proto,
         get_compute_environment_package_response_from_proto,
         get_compute_environment_package_response_to_proto,
         get_compute_evaluation_run_response_from_proto,
         get_compute_evaluation_run_response_to_proto, get_compute_index_response_from_proto,
         get_compute_index_response_to_proto, get_compute_synthetic_data_job_response_from_proto,
         get_compute_synthetic_data_job_response_to_proto,
+        get_compute_training_run_response_from_proto, get_compute_training_run_response_to_proto,
         get_structured_capacity_instrument_response_from_proto,
         get_structured_capacity_instrument_response_to_proto,
+        list_compute_adapter_training_windows_response_from_proto,
+        list_compute_adapter_training_windows_response_to_proto,
         list_compute_environment_packages_response_from_proto,
         list_compute_environment_packages_response_to_proto,
         list_compute_evaluation_runs_response_from_proto,
@@ -6413,6 +6547,8 @@ mod tests {
         list_compute_synthetic_data_jobs_response_to_proto,
         list_compute_synthetic_data_samples_response_from_proto,
         list_compute_synthetic_data_samples_response_to_proto,
+        list_compute_training_runs_response_from_proto,
+        list_compute_training_runs_response_to_proto,
         list_structured_capacity_instruments_response_from_proto,
         list_structured_capacity_instruments_response_to_proto,
         record_compute_synthetic_data_verification_request_from_proto,
@@ -6444,19 +6580,22 @@ mod tests {
     use crate::compute::{
         ApplePlatformCapability, CapacityInstrument, CapacityInstrumentClosureReason,
         CapacityInstrumentKind, CapacityInstrumentStatus, CapacityLot, CapacityLotStatus,
-        CapacityNonDeliveryReason, CapacityReserveState, ComputeArtifactResidency,
-        ComputeBackendFamily, ComputeCapabilityEnvelope, ComputeCheckpointBinding,
-        ComputeDeliveryVarianceReason, ComputeEnvironmentArtifactExpectation,
-        ComputeEnvironmentBinding, ComputeEnvironmentDatasetBinding, ComputeEnvironmentHarness,
-        ComputeEnvironmentPackage, ComputeEnvironmentPackageStatus,
-        ComputeEnvironmentRubricBinding, ComputeEvaluationArtifact, ComputeEvaluationMetric,
-        ComputeEvaluationRun, ComputeEvaluationRunStatus, ComputeEvaluationSample,
-        ComputeEvaluationSampleStatus, ComputeEvaluationSummary, ComputeExecutionKind,
-        ComputeFamily, ComputeIndex, ComputeIndexCorrectionReason, ComputeIndexStatus,
-        ComputeProduct, ComputeProductStatus, ComputeProofPosture, ComputeProvisioningKind,
-        ComputeSettlementFailureReason, ComputeSettlementMode, ComputeSyntheticDataJob,
-        ComputeSyntheticDataJobStatus, ComputeSyntheticDataSample,
-        ComputeSyntheticDataSampleStatus, ComputeTopologyKind, ComputeValidatorRequirements,
+        CapacityNonDeliveryReason, CapacityReserveState, ComputeAdapterCheckpointPointer,
+        ComputeAdapterPolicyRevision, ComputeAdapterTrainingWindow, ComputeAdapterWindowStatus,
+        ComputeArtifactResidency, ComputeBackendFamily, ComputeCapabilityEnvelope,
+        ComputeCheckpointBinding, ComputeDeliveryVarianceReason,
+        ComputeEnvironmentArtifactExpectation, ComputeEnvironmentBinding,
+        ComputeEnvironmentDatasetBinding, ComputeEnvironmentHarness, ComputeEnvironmentPackage,
+        ComputeEnvironmentPackageStatus, ComputeEnvironmentRubricBinding,
+        ComputeEvaluationArtifact, ComputeEvaluationMetric, ComputeEvaluationRun,
+        ComputeEvaluationRunStatus, ComputeEvaluationSample, ComputeEvaluationSampleStatus,
+        ComputeEvaluationSummary, ComputeExecutionKind, ComputeFamily, ComputeIndex,
+        ComputeIndexCorrectionReason, ComputeIndexStatus, ComputeProduct, ComputeProductStatus,
+        ComputeProofPosture, ComputeProvisioningKind, ComputeSettlementFailureReason,
+        ComputeSettlementMode, ComputeSyntheticDataJob, ComputeSyntheticDataJobStatus,
+        ComputeSyntheticDataSample, ComputeSyntheticDataSampleStatus, ComputeTopologyKind,
+        ComputeTrainingReplicaType, ComputeTrainingRun, ComputeTrainingRunStatus,
+        ComputeTrainingSummary, ComputeTrainingWorkClass, ComputeValidatorRequirements,
         DeliveryProof, DeliveryProofStatus, DeliverySandboxEvidence, DeliveryTopologyEvidence,
         DeliveryVerificationEvidence, GptOssRuntimeCapability, StructuredCapacityInstrument,
         StructuredCapacityInstrumentKind, StructuredCapacityInstrumentStatus,
@@ -6712,6 +6851,130 @@ mod tests {
             status: ComputeSyntheticDataSampleStatus::Verified,
             recorded_at_ms: 1_762_000_521_000,
             metadata: json!({"prompt_tokens": 64}),
+        }
+    }
+
+    fn training_run_fixture() -> ComputeTrainingRun {
+        ComputeTrainingRun {
+            training_run_id: "train.alpha".to_string(),
+            training_policy_ref: "policy://training/alpha".to_string(),
+            environment_binding: ComputeEnvironmentBinding {
+                environment_ref: "env.openagents.alpha".to_string(),
+                environment_version: Some("2026.04.11".to_string()),
+                dataset_ref: Some("dataset://alpha/train".to_string()),
+                rubric_ref: None,
+                evaluator_policy_ref: None,
+            },
+            checkpoint_binding: ComputeCheckpointBinding {
+                checkpoint_family: "decoder".to_string(),
+                latest_checkpoint_ref: Some("checkpoint://decoder/base".to_string()),
+                recovery_posture: Some("resume_from_latest".to_string()),
+            },
+            validator_policy_ref: "policy://validator/alpha".to_string(),
+            work_class: ComputeTrainingWorkClass::FullIslandLocalUpdateTraining,
+            replica_type: ComputeTrainingReplicaType::Island,
+            benchmark_package_refs: vec!["benchmark://alpha".to_string()],
+            product_id: Some("psionic.training.gradient.elastic".to_string()),
+            capacity_lot_id: None,
+            instrument_id: None,
+            delivery_proof_id: None,
+            model_ref: Some("model://alpha".to_string()),
+            source_ref: Some("artifact://alpha/input".to_string()),
+            rollout_verification_eval_run_ids: vec!["eval.alpha".to_string()],
+            created_at_ms: 1_762_000_600_000,
+            started_at_ms: Some(1_762_000_600_100),
+            finalized_at_ms: Some(1_762_000_700_000),
+            expected_step_count: Some(500),
+            completed_step_count: Some(500),
+            status: ComputeTrainingRunStatus::Accepted,
+            final_checkpoint_ref: Some("checkpoint://decoder/train.alpha/final".to_string()),
+            promotion_checkpoint_ref: Some(
+                "checkpoint://decoder/train.alpha/promotion".to_string(),
+            ),
+            summary: Some(ComputeTrainingSummary {
+                completed_step_count: Some(500),
+                processed_token_count: Some(1_024_000),
+                average_loss: Some(0.12),
+                best_eval_score_bps: Some(9_650),
+                accepted_checkpoint_ref: Some(
+                    "checkpoint://decoder/train.alpha/promotion".to_string(),
+                ),
+                aggregate_metrics: vec![ComputeEvaluationMetric {
+                    metric_id: "held_out_accuracy".to_string(),
+                    metric_value: 0.965,
+                    unit: Some("fraction".to_string()),
+                    metadata: json!({}),
+                }],
+                artifacts: vec![ComputeEvaluationArtifact {
+                    artifact_kind: "training_manifest".to_string(),
+                    artifact_ref: "artifact://alpha/training_manifest".to_string(),
+                    digest: Some("sha256:manifest".to_string()),
+                    metadata: json!({}),
+                }],
+            }),
+            metadata: json!({"network_id": "alpha"}),
+        }
+    }
+
+    fn adapter_training_window_fixture() -> ComputeAdapterTrainingWindow {
+        ComputeAdapterTrainingWindow {
+            window_id: "window.alpha".to_string(),
+            training_run_id: "train.alpha".to_string(),
+            stage_id: "adapter.sft".to_string(),
+            contributor_set_revision_id: "contributors.rev1".to_string(),
+            validator_policy_ref: "policy://validator/alpha".to_string(),
+            work_class: ComputeTrainingWorkClass::AdapterTraining,
+            replica_type: ComputeTrainingReplicaType::SingleNode,
+            round_index: Some(7),
+            base_checkpoint_ref: "checkpoint://decoder/train.alpha/promotion".to_string(),
+            planned_local_step_count: Some(500),
+            aggregation_rule: Some("weighted_avg".to_string()),
+            aggregation_weight_basis: Some("tokens".to_string()),
+            adapter_target_id: "adapter.target.alpha".to_string(),
+            adapter_family: "openagents.adapter.reference".to_string(),
+            base_model_ref: "model://alpha".to_string(),
+            adapter_format: "openagents.adapter.delta.v1".to_string(),
+            source_policy_revision: ComputeAdapterPolicyRevision {
+                policy_family: "policy://training/alpha".to_string(),
+                revision_id: "policy-rev-1".to_string(),
+                revision_number: Some(1),
+                policy_digest: "sha256:policy-rev-1".to_string(),
+                parent_revision_id: None,
+                produced_at_ms: 1_762_000_600_000,
+            },
+            source_checkpoint_pointer: ComputeAdapterCheckpointPointer {
+                scope_kind: "training_run".to_string(),
+                scope_id: "train.alpha".to_string(),
+                checkpoint_family: "decoder".to_string(),
+                checkpoint_ref: "checkpoint://decoder/train.alpha/promotion".to_string(),
+                manifest_digest: "sha256:checkpoint".to_string(),
+                updated_at_ms: 1_762_000_600_050,
+                pointer_digest: "sha256:pointer".to_string(),
+            },
+            status: ComputeAdapterWindowStatus::Reconciled,
+            total_contributions: 2,
+            admitted_contributions: 2,
+            accepted_contributions: 2,
+            quarantined_contributions: 0,
+            rejected_contributions: 0,
+            replay_required_contributions: 0,
+            replay_checked_contributions: 2,
+            held_out_average_score_bps: Some(9_500),
+            benchmark_pass_rate_bps: Some(9_400),
+            runtime_smoke_passed: Some(true),
+            promotion_ready: true,
+            gate_reason_codes: Vec::new(),
+            window_summary_digest: "sha256:window-summary".to_string(),
+            promotion_disposition: None,
+            hold_reason_codes: Vec::new(),
+            aggregated_delta_digest: Some("sha256:aggregate".to_string()),
+            accepted_aggregate_id: Some("aggregate.alpha".to_string()),
+            output_policy_revision: None,
+            output_checkpoint_pointer: None,
+            promoted_checkpoint_ref: None,
+            accepted_outcome_id: Some("accepted.window.alpha".to_string()),
+            recorded_at_ms: 1_762_000_700_000,
+            metadata: json!({"network_id": "alpha"}),
         }
     }
 
@@ -7896,5 +8159,68 @@ mod tests {
         )
         .expect("synthetic samples roundtrip");
         assert_eq!(samples_roundtrip, samples);
+    }
+
+    #[test]
+    fn training_run_roundtrip_preserves_work_class_and_replica_type() {
+        let run = training_run_fixture();
+        let roundtrip = get_compute_training_run_response_from_proto(
+            &get_compute_training_run_response_to_proto(&run).expect("training run proto"),
+        )
+        .expect("training run roundtrip");
+        assert_eq!(
+            roundtrip.work_class,
+            ComputeTrainingWorkClass::FullIslandLocalUpdateTraining
+        );
+        assert_eq!(roundtrip.replica_type, ComputeTrainingReplicaType::Island);
+
+        let runs = vec![run.clone()];
+        let list_roundtrip = list_compute_training_runs_response_from_proto(
+            &list_compute_training_runs_response_to_proto(runs.as_slice())
+                .expect("training run list proto"),
+        )
+        .expect("training run list roundtrip");
+        assert_eq!(list_roundtrip, runs);
+    }
+
+    #[test]
+    fn adapter_training_window_roundtrip_preserves_work_class_and_replica_type() {
+        let window = adapter_training_window_fixture();
+        let roundtrip = get_compute_adapter_training_window_response_from_proto(
+            &get_compute_adapter_training_window_response_to_proto(&window)
+                .expect("training window proto"),
+        )
+        .expect("training window roundtrip");
+        assert_eq!(
+            roundtrip.work_class,
+            ComputeTrainingWorkClass::AdapterTraining
+        );
+        assert_eq!(
+            roundtrip.replica_type,
+            ComputeTrainingReplicaType::SingleNode
+        );
+        assert_eq!(roundtrip.round_index, Some(7));
+        assert_eq!(
+            roundtrip.base_checkpoint_ref,
+            "checkpoint://decoder/train.alpha/promotion"
+        );
+        assert_eq!(roundtrip.planned_local_step_count, Some(500));
+        assert_eq!(roundtrip.aggregation_rule.as_deref(), Some("weighted_avg"));
+        assert_eq!(
+            roundtrip.aggregation_weight_basis.as_deref(),
+            Some("tokens")
+        );
+        assert_eq!(
+            roundtrip.accepted_aggregate_id.as_deref(),
+            Some("aggregate.alpha")
+        );
+
+        let windows = vec![window.clone()];
+        let list_roundtrip = list_compute_adapter_training_windows_response_from_proto(
+            &list_compute_adapter_training_windows_response_to_proto(windows.as_slice())
+                .expect("training window list proto"),
+        )
+        .expect("training window list roundtrip");
+        assert_eq!(list_roundtrip, windows);
     }
 }

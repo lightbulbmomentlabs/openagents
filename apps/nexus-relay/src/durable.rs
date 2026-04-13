@@ -33,6 +33,7 @@ const MAX_PROXY_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const NEXUS_PRODUCT_NAME: &str = "OpenAgents Nexus";
 const NEXUS_PRODUCT_DESCRIPTION: &str = "The OpenAgents relay and authority host for Autopilot.";
 const MANAGED_GROUPS_MODE_DEFERRED: &str = "deferred";
+const HOMEPAGE_TEMPLATE: &str = include_str!("homepage_template.html");
 
 #[derive(Debug, Clone)]
 pub struct DurableRelayConfig {
@@ -400,14 +401,12 @@ fn render_homepage(config: &DurableRelayConfig) -> String {
     let public_http_url = config
         .public_http_url()
         .unwrap_or_else(|| "http://127.0.0.1/".to_string());
-    format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>{name}</title><style>body{{margin:0;background:#050b16;color:#d6dfec;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}}main{{max-width:880px;margin:0 auto;padding:56px 24px 80px}}h1{{margin:0;font-size:40px;line-height:1.05;color:#f8fbff}}p{{line-height:1.65;color:#93a4ba}}code{{background:#0e1828;color:#a9d7ff;padding:2px 6px;border-radius:6px}}.lede{{max-width:60ch;margin-top:12px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-top:28px}}.panel{{padding:18px 20px;border-radius:14px;border:1px solid #1c3553;background:#091120;box-shadow:0 10px 30px rgba(0,0,0,.25)}}.label{{display:block;margin-bottom:8px;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:#6f89a8}}.value{{font-size:14px;line-height:1.55;color:#f1f6fd;word-break:break-word}}ul{{margin:0;padding-left:18px}}li+li{{margin-top:8px}}</style></head><body><main><h1>{name}</h1><p class=\"lede\">{description} Autopilot uses this host as its default Nexus for relay transport, hosted starter jobs, and kernel authority APIs.</p><div class=\"grid\"><section class=\"panel\"><span class=\"label\">Autopilot Default Relay</span><div class=\"value\"><code>{relay_ws}</code></div></section><section class=\"panel\"><span class=\"label\">Hosted Authority</span><div class=\"value\"><code>{relay_http}api/*</code><br><code>{relay_http}v1/*</code></div></section><section class=\"panel\"><span class=\"label\">Nostr Entry Points</span><div class=\"value\"><ul><li><code>{relay_ws}</code> websocket + NIP-11</li><li><code>{relay_http}ws</code> websocket alias</li><li><code>{relay_http}metrics</code> operator metrics</li></ul></div></section><section class=\"panel\"><span class=\"label\">Managed Groups</span><div class=\"value\">Deferred on the durable relay path until we add thin repository hooks for group reads and writes. The legacy in-memory managed-group module is not on the production path.</div></section><section class=\"panel\"><span class=\"label\">Durable Storage</span><div class=\"value\"><code>{data_dir}</code></div></section></div></main></body></html>",
-        name = NEXUS_PRODUCT_NAME,
-        description = NEXUS_PRODUCT_DESCRIPTION,
-        relay_ws = config.public_ws_url,
-        relay_http = public_http_url,
-        data_dir = config.data_dir.display(),
-    )
+    HOMEPAGE_TEMPLATE
+        .replace("__NEXUS_NAME__", NEXUS_PRODUCT_NAME)
+        .replace("__NEXUS_DESCRIPTION__", NEXUS_PRODUCT_DESCRIPTION)
+        .replace("__RELAY_WS__", config.public_ws_url.as_str())
+        .replace("__RELAY_HTTP__", public_http_url.as_str())
+        .replace("__DATA_DIR__", &config.data_dir.display().to_string())
 }
 
 fn copy_proxy_response_headers(target: &mut HeaderMap, source: &HeaderMap) {
@@ -724,10 +723,17 @@ mod tests {
         assert!(body.contains(super::NEXUS_PRODUCT_DESCRIPTION));
         assert!(body.contains(expected_relay_url.as_str()));
         assert!(body.contains(expected_http_url.as_str()));
-        assert!(body.contains("Autopilot Default Relay"));
-        assert!(body.contains("Hosted Authority"));
-        assert!(body.contains("Managed Groups"));
-        assert!(body.contains("Deferred on the durable relay path"));
+        assert!(body.contains("Connected Pylons"));
+        assert!(body.contains("Public relay heartbeat and ready capacity"));
+        assert!(body.contains("Training Topology"));
+        assert!(body.contains("Work Class Mix"));
+        assert!(body.contains("Run Index"));
+        assert!(body.contains("Window Matrix"));
+        assert!(body.contains("Validator Pressure"));
+        assert!(body.contains("Checkpoint Lineage"));
+        assert!(body.contains("/api/homepage"));
+        assert!(body.contains("pylon-constellation"));
+        assert!(body.contains("What connected pylons are doing right now"));
         assert!(body.contains("kernel authority APIs"));
 
         server.abort();
@@ -805,6 +811,16 @@ mod tests {
             .send()
             .await?;
         assert_eq!(stats.status(), StatusCode::OK);
+
+        let homepage = client
+            .get(format!("http://{addr}/api/homepage"))
+            .send()
+            .await?;
+        assert_eq!(homepage.status(), StatusCode::OK);
+        let homepage: Value = homepage.json().await?;
+        assert!(homepage.get("stats").is_some());
+        assert!(homepage.get("training_summary").is_some());
+        assert!(homepage.get("training_nodes").is_some());
 
         let snapshot = client
             .get(format!("http://{addr}/v1/kernel/snapshots/0"))
